@@ -571,7 +571,7 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
 
         actual_frames_processed = 0
         with ThreadPoolExecutor(max_workers=SBS_WORKERS, thread_name_prefix="sbs") as sbs_pool:
-            pbar = progress.tqdm(total=target_frame_count, desc="Processing Frames")
+            pbar = progress.tqdm(range(target_frame_count), desc="Processing Frames")
             pending = []  # 已提交但未完成的 SBS future
             try:
                 while True:
