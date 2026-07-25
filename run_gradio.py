@@ -17,6 +17,9 @@ import tempfile
 import shutil
 import imageio
 import subprocess
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Assuming the depth_anything_v2 directory is in the same folder as main.py
 from depth_anything_v2.dpt import DepthAnythingV2
@@ -471,42 +474,138 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         except FileNotFoundError:
             print("ffmpeg/ffprobe not found. Audio will not be processed. Please ensure ffmpeg is installed and in PATH.")
 
-        # 4. 流式处理：逐帧抽取 → 深度推理 → SBS 合成，原始帧与深度图帧只在内存中停留，仅 SBS 帧落盘
-        print(f"Processing {target_frame_count} frames at {fps} FPS (stream, from frame {clip_start_frame} to {clip_end_frame})...")
-        # 定位到起始帧，以便只读取需要剪切的范围
-        cap.set(cv2.CAP_PROP_POS_FRAMES, clip_start_frame)
+        # 4. 多线程流水线处理：抽帧 → GPU 推理 → SBS+落盘 三级流水线，让 CPU 与 GPU 并行工作
+        print(f"Processing {target_frame_count} frames at {fps} FPS (pipeline, from frame {clip_start_frame} to {clip_end_frame})...")
 
         transform_normalize = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
+        # ===== 流水线配置 =====
+        # 阶段1→2 队列：缓存放送 GPU 的待推理帧（PIL 图像，受内存约束不宜过大）
+        GPU_QUEUE_SIZE = 2
+        # 阶段2→3 队列：缓存放待落盘的 SBS 图像（SBS 图宽度为原图 2 倍，体积较大）
+        SBS_QUEUE_SIZE = 8
+        # SBS 线程池大小：仅并发 PNG 编码 + 落盘（纯 CPU/I/O，安全并发）
+        SBS_WORKERS = min(4, (os.cpu_count() or 4))
+        # 队列结束哨兵（用 object() 避免 None 等合法值冲突）
+        _SENTINEL = object()
+
+        gpu_queue = queue.Queue(maxsize=GPU_QUEUE_SIZE)
+        sbs_queue = queue.Queue(maxsize=SBS_QUEUE_SIZE)
+        # 工作线程异常容器：任意线程出错时记录，主线程检测后中止并向上抛
+        worker_errors = []
+
+        # ===== 阶段1：抽帧 + 预处理（CPU + I/O）=====
+        def producer_fn():
+            nonlocal target_frame_count  # 视频提前结束时需修正外层总数
+            try:
+                # 定位到起始帧，以便只读取需要剪切的范围
+                cap.set(cv2.CAP_PROP_POS_FRAMES, clip_start_frame)
+                for i in range(target_frame_count):
+                    if worker_errors:  # 任意线程出错则提前结束
+                        break
+                    ret, frame = cap.read()
+                    if not ret:
+                        print(f"Warning: Could only read {i} frames out of {target_frame_count}.")
+                        target_frame_count = i  # 视频提前结束时修正总数
+                        break
+                    # OpenCV 读出为 BGR，转成 RGB 后构造 PIL 图像（等价于原来从 PNG 读取的效果）
+                    input_pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    # 仅传 PIL 图像；normalize 与上 GPU 都集中在 GPU 线程做
+                    gpu_queue.put((i, input_pil_image))
+            except Exception as e:
+                worker_errors.append(e)
+            finally:
+                cap.release()
+                gpu_queue.put(_SENTINEL)  # 通知下游结束
+
+        # ===== 阶段2：GPU 深度推理 + SBS 生成（单线程串行，避免多线程访问 GPU，兼容 MPS）=====
+        def gpu_worker_fn():
+            try:
+                while True:
+                    item = gpu_queue.get()
+                    if item is _SENTINEL:
+                        break
+                    if worker_errors:
+                        continue  # 出错后继续 drain 队列直到收到 SENTINEL，避免上游阻塞
+                    i, input_pil_image = item
+                    base_name = f"frame_{i:06d}"
+                    # 深度推理：normalize + 上 GPU + 模型推理
+                    image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
+                    depth_pil_image = process_depthmap_image(
+                        depth_model, image_tensor, device, dtype, is_metric,
+                        base_name, save_to_disk=False
+                    )
+                    # SBS 生成：内部也会用 GPU，与推理在同一线程串行，保证 GPU 单线程访问
+                    sbs_pil_image = generate_sbs_image_from_depth(
+                        input_pil_image, depth_pil_image, model_name,
+                        sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
+                    )
+                    sbs_queue.put((i, sbs_pil_image))
+            except Exception as e:
+                worker_errors.append(e)
+            finally:
+                sbs_queue.put(_SENTINEL)  # 通知下游结束
+
+        # ===== 阶段3 单帧任务：SBS 图像落盘（在线程池里并行执行 PNG 编码 + I/O）=====
+        def sbs_task(item):
+            i, sbs_pil_image = item
+            # 单帧失败不影响整体流程，捕获后跳过该帧
+            try:
+                if sbs_pil_image is not None:
+                    base_name = f"frame_{i:06d}"
+                    sbs_pil_image.save(os.path.join(frames_sbs_dir, f"sbs_{base_name}.png"))
+                else:
+                    gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
+            except Exception as e:
+                print(f"Frame {i} save failed: {e}. Skipping.")
+            return i
+
+        # ===== 启动流水线（producer 与 gpu_worker 为后台线程，主线程消费 sbs_queue 协调进度）=====
+        producer_thread = threading.Thread(target=producer_fn, name="frame-producer", daemon=True)
+        gpu_thread = threading.Thread(target=gpu_worker_fn, name="gpu-worker", daemon=True)
+        producer_thread.start()
+        gpu_thread.start()
+
         actual_frames_processed = 0
-        for i in progress.tqdm(range(target_frame_count), desc="Processing Frames"):
-            ret, frame = cap.read()
-            if not ret:
-                print(f"Warning: Could only read {i} frames out of {target_frame_count}.")
-                target_frame_count = i # Adjust frame count if video ends prematurely
-                break
-            # OpenCV 读出为 BGR，转成 RGB 后构造 PIL 图像（等价于原来从 PNG 读取的效果）
-            input_pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            base_name = f"frame_{i:06d}"
+        with ThreadPoolExecutor(max_workers=SBS_WORKERS, thread_name_prefix="sbs") as sbs_pool:
+            pbar = progress.tqdm(total=target_frame_count, desc="Processing Frames")
+            pending = []  # 已提交但未完成的 SBS future
+            try:
+                while True:
+                    # 收割已完成的 future，及时更新进度（每轮先 drain 完成的，再取新任务）
+                    for f in [x for x in pending if x.done()]:
+                        f.result()  # 重抛任务异常（sbs_task 内部已 try，这里通常不会抛）
+                        pending.remove(f)
+                        pbar.update(1)
+                        actual_frames_processed += 1
+                    # 从 sbs_queue 取一项；带超时以便期间能收割已完成任务，避免进度条卡顿
+                    try:
+                        item = sbs_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        if worker_errors:
+                            break
+                        continue
+                    if item is _SENTINEL:
+                        break
+                    if worker_errors:
+                        continue
+                    pending.append(sbs_pool.submit(sbs_task, item))
+                # 等待所有剩余 SBS 任务完成
+                for fut in as_completed(pending):
+                    fut.result()
+                    pbar.update(1)
+                    actual_frames_processed += 1
+            finally:
+                pbar.close()
+                producer_thread.join(timeout=5)
+                gpu_thread.join(timeout=5)
 
-            # Depth Map（视频流式处理不落盘深度图）
-            image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
-            depth_pil_image = process_depthmap_image(depth_model, image_tensor, device, dtype, is_metric, base_name, save_to_disk=False)
-
-            # SBS Image（最终合成视频所需的帧，必须落盘）
-            sbs_pil_image = generate_sbs_image_from_depth(
-                input_pil_image, depth_pil_image, model_name,
-                sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
-            )
-            if sbs_pil_image:
-                sbs_pil_image.save(os.path.join(frames_sbs_dir, f"sbs_{base_name}.png"))
-            else:
-                gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
-            actual_frames_processed += 1
-        cap.release()
+        # 工作线程异常向上抛（取第一个）
+        if worker_errors:
+            raise worker_errors[0]
 
         if actual_frames_processed == 0:
             gr.Error("No frames could be extracted from the video.")
