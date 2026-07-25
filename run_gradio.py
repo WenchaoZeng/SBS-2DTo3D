@@ -718,13 +718,21 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         if audio_extracted and os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 0:
             print(f"Adding audio back to video: {final_output_video_path}")
             cmd_mux = ['ffmpeg', '-y', '-i', sbs_video_no_audio_path, '-i', temp_audio_path, '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', '-shortest', final_output_video_path]
-            mux_result = subprocess.run(cmd_mux, capture_output=True, text=True, check=False)
-            if mux_result.returncode != 0:
-                print(f"ffmpeg error during audio muxing: {mux_result.stderr}")
-                print("Falling back to video without audio.")
+            # mux 合并音频(最多重试 3 次,避免偶发 ffmpeg 失败导致最终视频无声)
+            mux_ok = False
+            for attempt in range(1, 4):
+                mux_result = subprocess.run(cmd_mux, capture_output=True, text=True, check=False)
+                if mux_result.returncode == 0:
+                    mux_ok = True
+                    print(f"Audio muxed successfully (attempt {attempt}/3).")
+                    break
+                # 上次失败可能留下残缺文件,清理后再重试
+                if os.path.exists(final_output_video_path):
+                    os.remove(final_output_video_path)
+                print(f"ffmpeg error during audio muxing (attempt {attempt}/3): {mux_result.stderr}")
+            if not mux_ok:
+                print("All mux attempts failed. Falling back to video without audio.")
                 shutil.move(sbs_video_no_audio_path, final_output_video_path)
-            else:
-                print("Audio muxed successfully.")
         else:
             print(f"Saving video without audio (or audio processing failed/not present): {final_output_video_path}")
             shutil.move(sbs_video_no_audio_path, final_output_video_path)
