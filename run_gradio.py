@@ -782,7 +782,7 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
                 with gr.Row():
                     sbs_method_video = gr.Dropdown(choices=["mesh_warping", "grid_sampling"], value="mesh_warping", label="SBS Method")       
                     sbs_mode_video = gr.Dropdown(choices=["parallel", "cross-eyed"], value="parallel", label="SBS View Mode")
-                sbs_depth_scale_video = gr.Slider(minimum=1, maximum=150, value=60, step=1, label="SBS Depth Scale")
+                sbs_depth_scale_video = gr.Slider(minimum=1, maximum=150, value=40, step=1, label="SBS Depth Scale")
                 sbs_depth_blur_strength_video = gr.Slider(minimum=1, maximum=15, value=7, step=2, label="SBS Depth Blur Strength (Odd Values)")
             process_video_button = gr.Button("Process SBS 3D Video", variant="primary")
     
