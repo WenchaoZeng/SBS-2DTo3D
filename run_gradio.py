@@ -494,7 +494,6 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         _SENTINEL = object()
 
         gpu_queue = queue.Queue(maxsize=GPU_QUEUE_SIZE)
-        sbs_queue = queue.Queue(maxsize=SBS_QUEUE_SIZE)
         # 工作线程异常容器：任意线程出错时记录，主线程检测后中止并向上抛
         worker_errors = []
 
@@ -576,58 +575,9 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                 cap.release()
                 gpu_queue.put(_SENTINEL)  # 通知下游结束
 
-        # ===== 阶段2：GPU 深度推理 + SBS 生成（单线程串行，避免多线程访问 GPU，兼容 MPS）=====
-        def gpu_worker_fn():
-            try:
-                while True:
-                    item = gpu_queue.get()
-                    if item is _SENTINEL:
-                        break
-                    if worker_errors:
-                        continue  # 出错后继续 drain 队列直到收到 SENTINEL，避免上游阻塞
-                    # 队列等待 = 出队时刻 - 入队时刻（反映 producer 是否供得上 GPU）
-                    gpu_dequeue_t = time.perf_counter()
-                    i, input_pil_image, gpu_enqueue_t = item
-                    gpu_wait_ms = (gpu_dequeue_t - gpu_enqueue_t) * 1000
-                    base_name = f"frame_{i:06d}"
-                    # 深度推理：normalize + 上 GPU
-                    t0 = time.perf_counter()
-                    image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
-                    t1 = time.perf_counter()
-                    to_gpu_ms = (t1 - t0) * 1000
-                    # 模型推理（save_to_disk=False，仅返回深度 PIL 图像）
-                    t0 = time.perf_counter()
-                    depth_pil_image = process_depthmap_image(
-                        depth_model, image_tensor, device, dtype, is_metric,
-                        base_name, save_to_disk=False
-                    )
-                    t1 = time.perf_counter()
-                    infer_ms = (t1 - t0) * 1000
-                    # SBS 生成：内部也会用 GPU，与推理在同一线程串行，保证 GPU 单线程访问
-                    t0 = time.perf_counter()
-                    sbs_pil_image = generate_sbs_image_from_depth(
-                        input_pil_image, depth_pil_image, model_name,
-                        sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
-                    )
-                    t1 = time.perf_counter()
-                    sbs_ms = (t1 - t0) * 1000
-                    # 把本阶段耗时回写该帧字典
-                    with frame_timings_lock:
-                        d = frame_timings.get(i, {})
-                        d.update({"gpu_wait_ms": gpu_wait_ms, "to_gpu_ms": to_gpu_ms,
-                                  "infer_ms": infer_ms, "sbs_ms": sbs_ms})
-                        frame_timings[i] = d
-                    # 记录入队时刻，供 sbs_task 计算队列等待
-                    sbs_enqueue_t = time.perf_counter()
-                    sbs_queue.put((i, sbs_pil_image, sbs_enqueue_t))
-            except Exception as e:
-                worker_errors.append(e)
-            finally:
-                sbs_queue.put(_SENTINEL)  # 通知下游结束
-
         # ===== 阶段3 单帧任务：SBS 图像落盘（在线程池里并行执行 PNG 编码 + I/O）=====
         def sbs_task(item):
-            # 队列等待 = 出队时刻 - 入队时刻（反映 GPU 阶段是否供得上落盘）
+            # 队列等待 = 出队时刻 - 入队时刻（反映主线程 GPU 阶段是否供得上落盘）
             sbs_dequeue_t = time.perf_counter()
             i, sbs_pil_image, sbs_enqueue_t = item
             sbs_wait_ms = (sbs_dequeue_t - sbs_enqueue_t) * 1000
@@ -648,11 +598,9 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
             _record_and_maybe_summary(i, {"sbs_wait_ms": sbs_wait_ms, "save_ms": save_ms})
             return i
 
-        # ===== 启动流水线（producer 与 gpu_worker 为后台线程，主线程消费 sbs_queue 协调进度）=====
+        # ===== 启动流水线（producer 为后台线程负责读帧；GPU 推理在主线程做，MPS 在主线程性能最佳）=====
         producer_thread = threading.Thread(target=producer_fn, name="frame-producer", daemon=True)
-        gpu_thread = threading.Thread(target=gpu_worker_fn, name="gpu-worker", daemon=True)
         producer_thread.start()
-        gpu_thread.start()
 
         actual_frames_processed = 0
         with ThreadPoolExecutor(max_workers=SBS_WORKERS, thread_name_prefix="sbs") as sbs_pool:
@@ -660,15 +608,15 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
             pending = []  # 已提交但未完成的 SBS future
             try:
                 while True:
-                    # 收割已完成的 future，及时更新进度（每轮先 drain 完成的，再取新任务）
+                    # 收割已完成的落盘 future，及时更新进度
                     for f in [x for x in pending if x.done()]:
-                        f.result()  # 重抛任务异常（sbs_task 内部已 try，这里通常不会抛）
+                        f.result()
                         pending.remove(f)
                         pbar.update(1)
                         actual_frames_processed += 1
-                    # 从 sbs_queue 取一项；带超时以便期间能收割已完成任务，避免进度条卡顿
+                    # 从 gpu_queue 取一帧；带超时以便期间能收割已完成任务，避免进度条卡顿
                     try:
-                        item = sbs_queue.get(timeout=0.2)
+                        item = gpu_queue.get(timeout=0.2)
                     except queue.Empty:
                         if worker_errors:
                             break
@@ -677,8 +625,43 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                         break
                     if worker_errors:
                         continue
-                    pending.append(sbs_pool.submit(sbs_task, item))
-                # 等待所有剩余 SBS 任务完成
+                    # ===== 阶段2：GPU 深度推理 + SBS 生成（在主线程执行：MPS 后端在主线程性能最佳，
+                    # 早期版本把推理放进 daemon 后台线程导致单帧从 0.12s 劣化到 10s+，切勿改回后台线程）=====
+                    gpu_dequeue_t = time.perf_counter()
+                    i, input_pil_image, gpu_enqueue_t = item
+                    gpu_wait_ms = (gpu_dequeue_t - gpu_enqueue_t) * 1000
+                    base_name = f"frame_{i:06d}"
+                    # 深度推理：normalize + 上 GPU
+                    t0 = time.perf_counter()
+                    image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
+                    t1 = time.perf_counter()
+                    to_gpu_ms = (t1 - t0) * 1000
+                    # 模型推理
+                    t0 = time.perf_counter()
+                    depth_pil_image = process_depthmap_image(
+                        depth_model, image_tensor, device, dtype, is_metric,
+                        base_name, save_to_disk=False
+                    )
+                    t1 = time.perf_counter()
+                    infer_ms = (t1 - t0) * 1000
+                    # SBS 生成（内部也会用 GPU，与推理在主线程串行）
+                    t0 = time.perf_counter()
+                    sbs_pil_image = generate_sbs_image_from_depth(
+                        input_pil_image, depth_pil_image, model_name,
+                        sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
+                    )
+                    t1 = time.perf_counter()
+                    sbs_ms = (t1 - t0) * 1000
+                    # 回写本阶段耗时
+                    with frame_timings_lock:
+                        d = frame_timings.get(i, {})
+                        d.update({"gpu_wait_ms": gpu_wait_ms, "to_gpu_ms": to_gpu_ms,
+                                  "infer_ms": infer_ms, "sbs_ms": sbs_ms})
+                        frame_timings[i] = d
+                    # 提交落盘任务到线程池（记录入队时刻供 sbs_task 计算等待）
+                    sbs_enqueue_t = time.perf_counter()
+                    pending.append(sbs_pool.submit(sbs_task, (i, sbs_pil_image, sbs_enqueue_t)))
+                # 等待所有剩余落盘任务完成
                 for fut in as_completed(pending):
                     fut.result()
                     pbar.update(1)
@@ -686,7 +669,6 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
             finally:
                 pbar.close()
                 producer_thread.join(timeout=5)
-                gpu_thread.join(timeout=5)
                 # 打印最终耗时汇总（全部帧的平均值），并关闭 CSV 文件
                 n = timing_count[0]
                 if n > 0:
