@@ -749,6 +749,29 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         if os.path.exists(work_parent_dir):
             print(f"中间文件已保存到: {work_parent_dir}")
 
+
+def generate_sbs_video_batch(video_path1, start1, end1, video_path2, start2, end2, video_path3, start3, end3, model_name, sbs_method, sbs_mode, sbs_depth_scale, sbs_depth_blur_strength, progress=gr.Progress(track_tqdm=True)):
+    """批量排队处理 3 个视频：依次调用 generate_sbs_video，完成一个就更新对应输出，再自动开始下一个。"""
+    # 待处理视频列表（路径 + 起止时间），路径留空的项自动跳过
+    videos = [
+        (video_path1, start1, end1),
+        (video_path2, start2, end2),
+        (video_path3, start3, end3),
+    ]
+    # 3 路输出占位，处理完成前对应位置保持 None
+    outputs = [None, None, None]
+    for idx, (vpath, st, et) in enumerate(videos):
+        if not vpath:  # 路径为空则跳过该项
+            continue
+        print(f"\n=== 排队处理 第 {idx+1}/3 个视频: {vpath} ===")
+        outputs[idx] = generate_sbs_video(
+            vpath, model_name, sbs_method, sbs_mode,
+            sbs_depth_scale, sbs_depth_blur_strength, st, et, progress=progress
+        )
+        # 每完成一个视频就立即把结果推送到网页，随后再处理下一个
+        yield outputs[0], outputs[1], outputs[2]
+
+
 # ================================================
 # GRADIO UI
 with gr.Blocks(title="SBS 2D To 3D") as demo:
@@ -758,18 +781,25 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
     gr.Markdown("输入视频文件路径进行处理（支持 MP4, AVI, MOV, MKV, TS 等格式）")
     with gr.Row():
         with gr.Column(scale=1):
-            # 使用文本框直接输入视频文件路径
-            video_input_component = gr.Textbox(
-                label="视频文件路径",
-                placeholder="请输入视频文件的完整路径，例如: /path/to/video.ts",
-                lines=1
-            )
-            # 视频剪切：输入开始/结束时间（秒），留空或填0表示不剪切
+            # 3 个视频排队输入（路径 + 剪切时间），路径留空的会自动跳过
+            video_path_1 = gr.Textbox(label="视频 1 文件路径", placeholder="请输入视频文件的完整路径，例如: /path/to/video.ts", lines=1)
             with gr.Group():
-                gr.Markdown("#### 视频剪切（单位：秒，结束时间为 0 表示到视频结尾）")
+                gr.Markdown("#### 视频 1 剪切（单位：秒，结束时间为 0 表示到视频结尾）")
                 with gr.Row():
-                    video_start_time = gr.Number(label="开始时间（秒）", value=0, minimum=0, step=0.1)
-                    video_end_time = gr.Number(label="结束时间（秒）", value=0, minimum=0, step=0.1)
+                    video_start_time_1 = gr.Number(label="开始时间（秒）", value=0, minimum=0, step=0.1)
+                    video_end_time_1 = gr.Number(label="结束时间（秒）", value=0, minimum=0, step=0.1)
+            video_path_2 = gr.Textbox(label="视频 2 文件路径", placeholder="留空则跳过该视频", lines=1)
+            with gr.Group():
+                gr.Markdown("#### 视频 2 剪切")
+                with gr.Row():
+                    video_start_time_2 = gr.Number(label="开始时间（秒）", value=0, minimum=0, step=0.1)
+                    video_end_time_2 = gr.Number(label="结束时间（秒）", value=0, minimum=0, step=0.1)
+            video_path_3 = gr.Textbox(label="视频 3 文件路径", placeholder="留空则跳过该视频", lines=1)
+            with gr.Group():
+                gr.Markdown("#### 视频 3 剪切")
+                with gr.Row():
+                    video_start_time_3 = gr.Number(label="开始时间（秒）", value=0, minimum=0, step=0.1)
+                    video_end_time_3 = gr.Number(label="结束时间（秒）", value=0, minimum=0, step=0.1)
         with gr.Column(scale=1):
             model_dropdown_video = gr.Dropdown(
                 choices=AVAILABLE_MODELS,
@@ -787,24 +817,26 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
             process_video_button = gr.Button("Process SBS 3D Video", variant="primary")
     
     with gr.Row():
-        output_sbs_video_component = gr.Video(label="Generated SBS 3D Video", interactive=False)
+        output_sbs_video_1 = gr.Video(label="视频 1 输出", interactive=False)
+        output_sbs_video_2 = gr.Video(label="视频 2 输出", interactive=False)
+        output_sbs_video_3 = gr.Video(label="视频 3 输出", interactive=False)
 
     # ========================================
     # EVENT HANDLERS
     # ========================================
     process_video_button.click(
-        fn=generate_sbs_video,
+        fn=generate_sbs_video_batch,
         inputs=[
-            video_input_component,
+            video_path_1, video_start_time_1, video_end_time_1,
+            video_path_2, video_start_time_2, video_end_time_2,
+            video_path_3, video_start_time_3, video_end_time_3,
             model_dropdown_video,
             sbs_method_video,
             sbs_mode_video,       
             sbs_depth_scale_video,
             sbs_depth_blur_strength_video,
-            video_start_time,
-            video_end_time
         ],
-        outputs=[output_sbs_video_component]
+        outputs=[output_sbs_video_1, output_sbs_video_2, output_sbs_video_3]
     )
 
 if __name__ == "__main__":
