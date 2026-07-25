@@ -689,7 +689,6 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     })
             finally:
                 producer_thread.join(timeout=5)
-                pbar.close()
                 # 打印最终耗时汇总（全部帧的平均值），并关闭 CSV 文件
                 n = timing_count[0]
                 if n > 0:
