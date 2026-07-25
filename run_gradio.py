@@ -355,10 +355,49 @@ def generate_depth_and_sbs_combined(input_image, model_name, depthmap_input_scal
     
     return depth_map, sbs_image  # Return both outputs
 
+def convert_ts_to_mp4(video_path):
+    """
+    将 TS 格式视频（包括 .ts, .mts, .m2ts）转换为 MP4 格式，以便 OpenCV 能正常读取。
+    返回转换后的 MP4 文件路径；如果转换失败则返回原始路径。
+    """
+    # 检查文件扩展名是否为 TS 格式
+    if not video_path.lower().endswith('.ts'):
+        return video_path
+
+    print(f"检测到 TS 格式视频，正在转换为 MP4 格式...")
+    # 生成转换后的输出文件路径
+    mp4_path = os.path.splitext(video_path)[0] + ".mp4"
+
+    try:
+        # 使用 FFmpeg 将 TS 转换为 MP4，使用 H.264 编码
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            mp4_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(f"TS 视频已成功转换为: {mp4_path}")
+        return mp4_path
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg 转换 TS 视频失败: {e.stderr}")
+        return video_path
+    except FileNotFoundError:
+        print("未找到 FFmpeg，无法转换 TS 视频。请确保 FFmpeg 已安装并在 PATH 中。")
+        return video_path
+
+
 def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_method, sbs_mode, sbs_depth_scale, sbs_depth_blur_strength, progress=gr.Progress(track_tqdm=True)):
     if not video_path:
         gr.Warning("Please upload a video to process.")
         return None
+
+    # 如果是 TS 格式，先转换为 MP4
+    video_path = convert_ts_to_mp4(video_path)
 
     # 1. Setup (device, dtype, load depth model)
     if torch.cuda.is_available(): 
@@ -562,10 +601,15 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
                 output_sbs_component = gr.Image(type="pil", label="Generated SBS 3D Image", height=480, interactive=False)
         
         with gr.Tab("Video"):
-            gr.Markdown("Upload a video to process")
+            gr.Markdown("输入视频文件路径进行处理（支持 MP4, AVI, MOV, MKV, TS 等格式）")
             with gr.Row():
                 with gr.Column(scale=1):
-                    video_input_component = gr.Video(label="Input Video", height=492)
+                    # 使用文本框直接输入视频文件路径
+                    video_input_component = gr.Textbox(
+                        label="视频文件路径",
+                        placeholder="请输入视频文件的完整路径，例如: /path/to/video.ts",
+                        lines=1
+                    )
                 with gr.Column(scale=1):
                     model_dropdown_video = gr.Dropdown( # Renamed
                         choices=AVAILABLE_MODELS,
