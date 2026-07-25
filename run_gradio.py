@@ -101,7 +101,7 @@ def load_model(model_name, device, models_dir='models/depthanything'):
 
     return model, dtype, is_metric
 
-def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output_filename_base, output_dir_frames="output", save_to_disk=True): # Added output_dir_frames with default for backward compatibility if called elsewhere
+def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output_filename_base, output_dir_frames="output", save_to_disk=True, return_tensor=False): # Added output_dir_frames with default for backward compatibility if called elsewhere
     # performs the core inference, and post-processes the raw depth output by (normalization, resizing), 
     # converts it to a PIL image, and saves it.
 
@@ -162,11 +162,9 @@ def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output
     if is_metric:
         depth = 1.0 - depth # Invert for metric models
 
-    # Convert to numpy array and scale to 0-255（.cpu() 会触发 GPU→CPU 同步）
-    depth_np = depth.cpu().numpy()
+    # 后处理完成，同步并计 post_ms（视频路径也要清缓存与计时）
     if device.type == 'mps':
         torch.mps.synchronize()
-    depth_visual = (depth_np * 255).astype(np.uint8)
     _LAST_DEPTH_DETAIL["post_ms"] = (time.perf_counter() - t_post_start) * 1000
 
     # 每帧推理后主动清理 GPU 缓存，防止长视频内存累积导致越来越慢（MPS 尤其敏感）
@@ -174,6 +172,14 @@ def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output
         torch.mps.empty_cache()
     elif device.type == 'cuda':
         torch.cuda.empty_cache()
+
+    # 视频路径：直接返回 GPU tensor，省掉 GPU→CPU→GPU 往返（深度图留给 SBS 在 GPU 上用）
+    if return_tensor:
+        return depth  # [H, W] GPU tensor，已 clamp + metric 反转
+
+    # 图片路径：转 CPU/numpy/PIL（需保存或返回 PIL）
+    depth_np = depth.cpu().numpy()
+    depth_visual = (depth_np * 255).astype(np.uint8)
 
     # Create PIL image (grayscale)
     depth_image = Image.fromarray(depth_visual)
@@ -267,12 +273,12 @@ def generate_depth_map_only(input_image, model_name):
         gr.Error(f"Error processing image for depth map: {e}")
         return None
 
-def generate_sbs_image_from_depth(original_input_image, depth_map_pil, model_name, sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength):
+def generate_sbs_image_from_depth(original_input_image, depth_map_pil, model_name, sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength, depth_map_tensor=None):
     """Generates the SBS 3D image using the original image and a pre-generated depth map."""
     if original_input_image is None:
         gr.Warning("Please provide the original input image for SBS generation.")
         return None
-    if depth_map_pil is None:
+    if depth_map_pil is None and depth_map_tensor is None:
         gr.Warning("Please generate or provide a depth map for SBS generation.")
         return None
     if model_name is None: # Needed for dtype
@@ -305,11 +311,14 @@ def generate_sbs_image_from_depth(original_input_image, depth_map_pil, model_nam
         base_image_for_sbs = base_image_for_sbs.to(device=device, dtype=torch.float16)
 
 
-        # Prepare depth_map for SBS: PIL to Tensor [1, H, W, 1], float16, range [0,1]
-        # depth_map_pil is already grayscale
-        depth_map_for_sbs = transform_to_tensor(depth_map_pil).permute(1, 2, 0).unsqueeze(0)
-        # Ensure correct dtype for SBS processing
-        depth_map_for_sbs = depth_map_for_sbs.to(device=device, dtype=torch.float16)
+        # Prepare depth_map for SBS：视频路径直传 GPU tensor，省掉 PIL→tensor→GPU 往返
+        if depth_map_tensor is not None:
+            depth_map_for_sbs = depth_map_tensor.to(device=device, dtype=torch.float16)
+        else:
+            # 图片路径：PIL to Tensor [1, H, W, 1], float16, range [0,1]（depth_map_pil 已是 grayscale）
+            depth_map_for_sbs = transform_to_tensor(depth_map_pil).permute(1, 2, 0).unsqueeze(0)
+            # Ensure correct dtype for SBS processing
+            depth_map_for_sbs = depth_map_for_sbs.to(device=device, dtype=torch.float16)
         
         # Ensure depth_blur_strength is odd for SBS
         if sbs_depth_blur_strength % 2 == 0:
@@ -595,59 +604,16 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         # ===== 启动流水线（producer 为后台线程负责读帧；GPU 推理在主线程做，MPS 在主线程性能最佳）=====
         actual_frames_processed = 0
         sbs_video_no_audio_path = os.path.join(work_parent_dir, "sbs_video_no_audio.mp4")
-        print("使用 VideoToolbox 硬件加速编码视频（SBS 与深度推理并行）...")
-        # 方案A：SBS + 编码放到单后台线程，与主线程深度推理并行（都用 MPS，本次用于实测是否冲突）
-        # sbs_queue 为 FIFO，单消费者天然保证视频帧顺序，无需 reorder 缓存
-        SBS_QUEUE_SIZE = 4
-
+        print("使用 VideoToolbox 硬件加速编码视频（主线程串行：推理→SBS→编码）...")
+        # SBS 与深度推理都用 MPS；多线程并发会触发 Metal command buffer 断言崩溃，故回退为单线程串行
         with imageio.get_writer(sbs_video_no_audio_path, fps=fps, codec='h264_videotoolbox', ffmpeg_params=['-b:v', '8M', '-pix_fmt', 'yuv420p']) as writer:
-            sbs_queue = queue.Queue(maxsize=SBS_QUEUE_SIZE)
-
-            # ===== SBS 后台线程：从 sbs_queue 按 FIFO 顺序做 SBS + 编码（帧顺序天然保证）=====
-            def sbs_worker_fn():
-                nonlocal actual_frames_processed
-                try:
-                    while True:
-                        item = sbs_queue.get()
-                        if item is _SENTINEL:
-                            break
-                        if worker_errors:
-                            continue
-                        i, input_pil_image, depth_pil_image, timing_partial = item
-                        # SBS 生成（GPU，与主线程深度推理并行——本次实测 MPS 多线程是否有效）
-                        t0 = time.perf_counter()
-                        sbs_pil_image = generate_sbs_image_from_depth(
-                            input_pil_image, depth_pil_image, model_name,
-                            sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
-                        )
-                        t1 = time.perf_counter()
-                        sbs_ms = (t1 - t0) * 1000
-                        # 流式编码（VideoToolbox 硬件编码）
-                        encode_ms = 0.0
-                        if sbs_pil_image is not None:
-                            t0 = time.perf_counter()
-                            writer.append_data(np.array(sbs_pil_image))
-                            t1 = time.perf_counter()
-                            encode_ms = (t1 - t0) * 1000
-                            pbar.update(1)
-                            actual_frames_processed += 1
-                        else:
-                            gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
-                        # 汇总该帧耗时（主线程字段已在 timing_partial，这里补 sbs/encode）
-                        timing_partial.update({"sbs_ms": sbs_ms, "encode_ms": encode_ms})
-                        _record_and_maybe_summary(i, timing_partial)
-                except Exception as e:
-                    worker_errors.append(e)
-
             pbar = progress.tqdm(range(target_frame_count), desc="Processing Frames")
-            # 启动 producer（读帧）与 sbs_worker（SBS+编码）两个后台线程
+            # 启动 producer（读帧）后台线程；推理+SBS+编码全在主线程串行
             producer_thread = threading.Thread(target=producer_fn, name="frame-producer", daemon=True)
-            sbs_thread = threading.Thread(target=sbs_worker_fn, name="sbs-worker", daemon=True)
             producer_thread.start()
-            sbs_thread.start()
             try:
                 while True:
-                    # 主线程：从 gpu_queue 取帧 → 深度推理 → 入 sbs_queue（SBS+编码交给后台）
+                    # 主线程：从 gpu_queue 取帧 → 深度推理 → SBS → 编码（串行，MPS 单线程最稳）
                     try:
                         item = gpu_queue.get(timeout=0.2)
                     except queue.Empty:
@@ -665,12 +631,16 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     base_name = f"frame_{i:06d}"
 
                     # 模型输入降采样：把"喂给模型"的图按最长边缩到 MAX_MODEL_SIDE（保持宽高比），
-                    # 原图 input_pil_image 保留，用于 SBS 与最终输出。深度图生成后再放大回原尺寸。
+                    # 并对齐到 14 的倍数（ViT patch 要求），避免 process_depthmap_image 内部二次 resize。
+                    # 原图 input_pil_image 保留，用于 SBS 与最终输出。
                     orig_w, orig_h = input_pil_image.size
                     longest = max(orig_w, orig_h)
                     if longest > MAX_MODEL_SIDE:
                         scale = MAX_MODEL_SIDE / longest
                         model_w, model_h = int(orig_w * scale), int(orig_h * scale)
+                        # 对齐到 14 的倍数（ViT patch_size=14 要求），省掉下游二次 resize
+                        model_w = model_w - (model_w % 14)
+                        model_h = model_h - (model_h % 14)
                         model_input_pil = input_pil_image.resize((model_w, model_h), Image.Resampling.BILINEAR)
                     else:
                         model_input_pil = input_pil_image
@@ -680,27 +650,45 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     image_tensor = transform_normalize(model_input_pil).unsqueeze(0).to(device=device, dtype=dtype)
                     t1 = time.perf_counter()
                     to_gpu_ms = (t1 - t0) * 1000
-                    # 模型推理（内部已做 mps.synchronize + empty_cache，并把 model/post 细分计时写入 _LAST_DEPTH_DETAIL）
-                    depth_pil_image = process_depthmap_image(
+                    # 模型推理（返回 GPU tensor，省掉 GPU→CPU→GPU 往返；内部已做 synchronize + empty_cache）
+                    depth_tensor = process_depthmap_image(
                         depth_model, image_tensor, device, dtype, is_metric,
-                        base_name, save_to_disk=False
+                        base_name, save_to_disk=False, return_tensor=True
+                    )  # [H_518, W_518] GPU tensor，已 clamp + metric 反转
+                    # 深度图在 GPU 上放大到原图尺寸（省掉 CPU PIL resize + 再搬 GPU），并转 SBS 期望的 shape [1, H, W, 1]
+                    orig_w, orig_h = input_pil_image.size
+                    depth_for_sbs = depth_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, H_518, W_518]
+                    depth_for_sbs = F.interpolate(depth_for_sbs, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
+                    depth_for_sbs = depth_for_sbs.permute(0, 2, 3, 1)  # [1, H, W, 1]
+                    # SBS 生成（深度图已在 GPU 直传；原图仍需搬上 GPU。主线程串行避免 MPS 多线程崩溃）
+                    t0 = time.perf_counter()
+                    sbs_pil_image = generate_sbs_image_from_depth(
+                        input_pil_image, None, model_name,
+                        sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength,
+                        depth_map_tensor=depth_for_sbs
                     )
-                    # 深度图放大回原始分辨率（深度图是平滑场，放大几乎无质量损失），再用于 SBS
-                    if depth_pil_image.size != input_pil_image.size:
-                        depth_pil_image = depth_pil_image.resize(input_pil_image.size, Image.Resampling.BILINEAR)
-                    # 主线程测得的 timing（sbs/encode 由 sbs_worker 补全）
-                    timing_partial = {
+                    t1 = time.perf_counter()
+                    sbs_ms = (t1 - t0) * 1000
+                    # 流式编码（VideoToolbox 硬件编码）
+                    encode_ms = 0.0
+                    if sbs_pil_image is not None:
+                        t0 = time.perf_counter()
+                        writer.append_data(np.array(sbs_pil_image))
+                        t1 = time.perf_counter()
+                        encode_ms = (t1 - t0) * 1000
+                        pbar.update(1)
+                        actual_frames_processed += 1
+                    else:
+                        gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
+                    # 汇总该帧所有耗时并写 CSV（read_ms 由 producer 预先写入 frame_timings）
+                    _record_and_maybe_summary(i, {
                         "gpu_wait_ms": gpu_wait_ms, "to_gpu_ms": to_gpu_ms,
                         "model_ms": _LAST_DEPTH_DETAIL["model_ms"],
                         "post_ms": _LAST_DEPTH_DETAIL["post_ms"],
-                    }
-                    # 入 sbs_queue；若 SBS 慢于推理，队列满会阻塞在此形成背压，天然匹配两边速率
-                    sbs_queue.put((i, input_pil_image, depth_pil_image, timing_partial))
-                # 推理结束，通知 sbs_worker 收尾
-                sbs_queue.put(_SENTINEL)
+                        "sbs_ms": sbs_ms, "encode_ms": encode_ms,
+                    })
             finally:
                 producer_thread.join(timeout=5)
-                sbs_thread.join(timeout=30)  # 等所有 SBS+编码完成（30s 足够余量）
                 pbar.close()
                 # 打印最终耗时汇总（全部帧的平均值），并关闭 CSV 文件
                 n = timing_count[0]
