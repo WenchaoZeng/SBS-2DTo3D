@@ -19,6 +19,7 @@ import imageio
 import subprocess
 import queue
 import threading
+import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Assuming the depth_anything_v2 directory is in the same folder as main.py
@@ -497,6 +498,54 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         # 工作线程异常容器：任意线程出错时记录，主线程检测后中止并向上抛
         worker_errors = []
 
+        # ===== 耗时日志基础设施（用于排查瓶颈，写到 output/<本次>/timing.csv）=====
+        timing_csv_path = os.path.join(work_parent_dir, "timing.csv")
+        timing_file = open(timing_csv_path, "w", newline="")
+        timing_writer = csv.writer(timing_file)
+        timing_writer.writerow(["frame", "read_ms", "gpu_wait_ms", "to_gpu_ms", "infer_ms", "sbs_ms", "sbs_wait_ms", "save_ms"])
+        timing_file.flush()
+        # 各阶段累计耗时（用于每 100 帧汇总打印），key 与 CSV 列名对应
+        timing_acc = {"read_ms": 0.0, "gpu_wait_ms": 0.0, "to_gpu_ms": 0.0,
+                      "infer_ms": 0.0, "sbs_ms": 0.0, "sbs_wait_ms": 0.0, "save_ms": 0.0}
+        timing_count = [0]  # 用 list 便于闭包内修改
+        # 每帧各阶段耗时字典：frame_idx -> dict，由各阶段线程写入，sbs_task 收尾汇总
+        frame_timings = {}
+        frame_timings_lock = threading.Lock()
+
+        def _record_and_maybe_summary(frame_idx, final_fields):
+            """sbs_task 收尾时调用：补全该帧所有耗时字段，写 CSV 行，并按 100 帧打印汇总"""
+            with frame_timings_lock:
+                d = frame_timings.pop(frame_idx, {})
+                d.update(final_fields)
+                timing_writer.writerow([
+                    frame_idx,
+                    f"{d.get('read_ms', 0):.1f}",
+                    f"{d.get('gpu_wait_ms', 0):.1f}",
+                    f"{d.get('to_gpu_ms', 0):.1f}",
+                    f"{d.get('infer_ms', 0):.1f}",
+                    f"{d.get('sbs_ms', 0):.1f}",
+                    f"{d.get('sbs_wait_ms', 0):.1f}",
+                    f"{d.get('save_ms', 0):.1f}",
+                ])
+                timing_file.flush()
+                # 累加汇总
+                for k in timing_acc:
+                    timing_acc[k] += d.get(k, 0.0)
+                timing_count[0] += 1
+                n = timing_count[0]
+                # 每 20 帧打印一次平均耗时（控制台便于实时观察）
+                if n % 20 == 0:
+                    print(f"[timing] {n} frames | "
+                          f"read={timing_acc['read_ms']/n:.0f} "
+                          f"gpu_wait={timing_acc['gpu_wait_ms']/n:.0f} "
+                          f"to_gpu={timing_acc['to_gpu_ms']/n:.0f} "
+                          f"infer={timing_acc['infer_ms']/n:.0f} "
+                          f"sbs={timing_acc['sbs_ms']/n:.0f} "
+                          f"sbs_wait={timing_acc['sbs_wait_ms']/n:.0f} "
+                          f"save={timing_acc['save_ms']/n:.0f} (ms/frame)")
+
+        print(f"耗时日志将写入: {timing_csv_path}")
+
         # ===== 阶段1：抽帧 + 预处理（CPU + I/O）=====
         def producer_fn():
             nonlocal target_frame_count  # 视频提前结束时需修正外层总数
@@ -512,9 +561,15 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                         target_frame_count = i  # 视频提前结束时修正总数
                         break
                     # OpenCV 读出为 BGR，转成 RGB 后构造 PIL 图像（等价于原来从 PNG 读取的效果）
+                    t0 = time.perf_counter()
                     input_pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    # 仅传 PIL 图像；normalize 与上 GPU 都集中在 GPU 线程做
-                    gpu_queue.put((i, input_pil_image))
+                    t1 = time.perf_counter()
+                    # 记录该帧读取+预处理耗时（供 sbs_task 汇总）
+                    with frame_timings_lock:
+                        frame_timings[i] = {"read_ms": (t1 - t0) * 1000}
+                    # 记录入队时刻，供 gpu_worker 计算队列等待
+                    gpu_enqueue_t = time.perf_counter()
+                    gpu_queue.put((i, input_pil_image, gpu_enqueue_t))
             except Exception as e:
                 worker_errors.append(e)
             finally:
@@ -530,20 +585,41 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                         break
                     if worker_errors:
                         continue  # 出错后继续 drain 队列直到收到 SENTINEL，避免上游阻塞
-                    i, input_pil_image = item
+                    # 队列等待 = 出队时刻 - 入队时刻（反映 producer 是否供得上 GPU）
+                    gpu_dequeue_t = time.perf_counter()
+                    i, input_pil_image, gpu_enqueue_t = item
+                    gpu_wait_ms = (gpu_dequeue_t - gpu_enqueue_t) * 1000
                     base_name = f"frame_{i:06d}"
-                    # 深度推理：normalize + 上 GPU + 模型推理
+                    # 深度推理：normalize + 上 GPU
+                    t0 = time.perf_counter()
                     image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
+                    t1 = time.perf_counter()
+                    to_gpu_ms = (t1 - t0) * 1000
+                    # 模型推理（save_to_disk=False，仅返回深度 PIL 图像）
+                    t0 = time.perf_counter()
                     depth_pil_image = process_depthmap_image(
                         depth_model, image_tensor, device, dtype, is_metric,
                         base_name, save_to_disk=False
                     )
+                    t1 = time.perf_counter()
+                    infer_ms = (t1 - t0) * 1000
                     # SBS 生成：内部也会用 GPU，与推理在同一线程串行，保证 GPU 单线程访问
+                    t0 = time.perf_counter()
                     sbs_pil_image = generate_sbs_image_from_depth(
                         input_pil_image, depth_pil_image, model_name,
                         sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
                     )
-                    sbs_queue.put((i, sbs_pil_image))
+                    t1 = time.perf_counter()
+                    sbs_ms = (t1 - t0) * 1000
+                    # 把本阶段耗时回写该帧字典
+                    with frame_timings_lock:
+                        d = frame_timings.get(i, {})
+                        d.update({"gpu_wait_ms": gpu_wait_ms, "to_gpu_ms": to_gpu_ms,
+                                  "infer_ms": infer_ms, "sbs_ms": sbs_ms})
+                        frame_timings[i] = d
+                    # 记录入队时刻，供 sbs_task 计算队列等待
+                    sbs_enqueue_t = time.perf_counter()
+                    sbs_queue.put((i, sbs_pil_image, sbs_enqueue_t))
             except Exception as e:
                 worker_errors.append(e)
             finally:
@@ -551,16 +627,25 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
 
         # ===== 阶段3 单帧任务：SBS 图像落盘（在线程池里并行执行 PNG 编码 + I/O）=====
         def sbs_task(item):
-            i, sbs_pil_image = item
+            # 队列等待 = 出队时刻 - 入队时刻（反映 GPU 阶段是否供得上落盘）
+            sbs_dequeue_t = time.perf_counter()
+            i, sbs_pil_image, sbs_enqueue_t = item
+            sbs_wait_ms = (sbs_dequeue_t - sbs_enqueue_t) * 1000
             # 单帧失败不影响整体流程，捕获后跳过该帧
+            save_ms = 0.0
             try:
                 if sbs_pil_image is not None:
                     base_name = f"frame_{i:06d}"
+                    t0 = time.perf_counter()
                     sbs_pil_image.save(os.path.join(frames_sbs_dir, f"sbs_{base_name}.png"))
+                    t1 = time.perf_counter()
+                    save_ms = (t1 - t0) * 1000
                 else:
                     gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
             except Exception as e:
                 print(f"Frame {i} save failed: {e}. Skipping.")
+            # 汇总该帧所有耗时并写 CSV（含每 20 帧控制台汇总）
+            _record_and_maybe_summary(i, {"sbs_wait_ms": sbs_wait_ms, "save_ms": save_ms})
             return i
 
         # ===== 启动流水线（producer 与 gpu_worker 为后台线程，主线程消费 sbs_queue 协调进度）=====
@@ -602,6 +687,19 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                 pbar.close()
                 producer_thread.join(timeout=5)
                 gpu_thread.join(timeout=5)
+                # 打印最终耗时汇总（全部帧的平均值），并关闭 CSV 文件
+                n = timing_count[0]
+                if n > 0:
+                    print(f"[timing-final] 共 {n} 帧 | "
+                          f"read={timing_acc['read_ms']/n:.0f} "
+                          f"gpu_wait={timing_acc['gpu_wait_ms']/n:.0f} "
+                          f"to_gpu={timing_acc['to_gpu_ms']/n:.0f} "
+                          f"infer={timing_acc['infer_ms']/n:.0f} "
+                          f"sbs={timing_acc['sbs_ms']/n:.0f} "
+                          f"sbs_wait={timing_acc['sbs_wait_ms']/n:.0f} "
+                          f"save={timing_acc['save_ms']/n:.0f} (ms/frame, 平均)")
+                    print(f"[timing-final] 逐帧详细耗时见: {timing_csv_path}")
+                timing_file.close()
 
         # 工作线程异常向上抛（取第一个）
         if worker_errors:
