@@ -359,6 +359,7 @@ def convert_ts_to_mp4(video_path):
     """
     将 TS 格式视频转换为 MP4 格式，以便 OpenCV 能正常读取。
     使用 VideoToolbox 硬件加速。
+    转换后的文件输出到 output 目录。
     返回转换后的 MP4 文件路径；如果转换失败则返回原始路径。
     """
     # 检查文件扩展名是否为 TS 格式
@@ -366,8 +367,11 @@ def convert_ts_to_mp4(video_path):
         return video_path
 
     print(f"检测到 TS 格式视频，正在转换为 MP4 格式...")
-    # 生成转换后的输出文件路径
-    mp4_path = os.path.splitext(video_path)[0] + ".mp4"
+    # 确保 output 目录存在
+    os.makedirs("output", exist_ok=True)
+    # 生成转换后的输出文件路径（输出到 output 目录）
+    filename = os.path.splitext(os.path.basename(video_path))[0] + ".mp4"
+    mp4_path = os.path.join("output", filename)
 
     try:
         # macOS 使用 VideoToolbox 硬件加速
