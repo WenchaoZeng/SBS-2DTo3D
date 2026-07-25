@@ -20,7 +20,6 @@ import subprocess
 import queue
 import threading
 import csv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Assuming the depth_anything_v2 directory is in the same folder as main.py
 from depth_anything_v2.dpt import DepthAnythingV2
@@ -440,10 +439,9 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
     final_output_video_path = os.path.join("output", output_video_base_name) # Ensure "output" dir exists
     os.makedirs("output", exist_ok=True)
     # 中间文件目录与最终输出视频使用同一时间戳，便于对应查看
+    # SBS 帧改为流式编码（直接喂给视频编码器），不再落盘，无需 frames_sbs 目录
     work_parent_dir = os.path.join("output", f"sbs_video_{work_timestamp}")
-    # 仅保留 SBS 帧目录（原始帧和深度图帧在内存中流式处理，不再落盘）
-    frames_sbs_dir = os.path.join(work_parent_dir, "frames_sbs")
-    os.makedirs(frames_sbs_dir, exist_ok=True)
+    os.makedirs(work_parent_dir, exist_ok=True)
 
     try:
         # 3. Video Info & Audio Extraction
@@ -504,15 +502,11 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
 
         # ===== 流水线配置 =====
         # 模型输入最长边上限：vitl 处理 1080p 会产生 ~1万 token，self-attention O(n²) 极慢（~10s/帧）。
-        # 仅缩放"喂给模型"的输入到最长边 640（token 数降 ~6 倍，attention 计算量降 ~40 倍），
+        # 仅缩放"喂给模型"的输入到最长边 518（Depth Anything V2 官方推荐尺寸，518=14×37 正好是整数个 patch），
         # 深度图生成后再放大回原始分辨率做 SBS，最终输出仍是原始分辨率，视觉质量几乎无损。
-        MAX_MODEL_SIDE = 640
+        MAX_MODEL_SIDE = 518
         # 阶段1→2 队列：缓存放送 GPU 的待推理帧（PIL 图像，受内存约束不宜过大）
         GPU_QUEUE_SIZE = 2
-        # 阶段2→3 队列：缓存放待落盘的 SBS 图像（SBS 图宽度为原图 2 倍，体积较大）
-        SBS_QUEUE_SIZE = 8
-        # SBS 线程池大小：仅并发 PNG 编码 + 落盘（纯 CPU/I/O，安全并发）
-        SBS_WORKERS = min(4, (os.cpu_count() or 4))
         # 队列结束哨兵（用 object() 避免 None 等合法值冲突）
         _SENTINEL = object()
 
@@ -524,18 +518,18 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         timing_csv_path = os.path.join(work_parent_dir, "timing.csv")
         timing_file = open(timing_csv_path, "w", newline="")
         timing_writer = csv.writer(timing_file)
-        timing_writer.writerow(["frame", "read_ms", "gpu_wait_ms", "to_gpu_ms", "model_ms", "post_ms", "sbs_ms", "sbs_wait_ms", "save_ms"])
+        timing_writer.writerow(["frame", "read_ms", "gpu_wait_ms", "to_gpu_ms", "model_ms", "post_ms", "sbs_ms", "encode_ms"])
         timing_file.flush()
         # 各阶段累计耗时（用于每 20 帧汇总打印），key 与 CSV 列名对应
         timing_acc = {"read_ms": 0.0, "gpu_wait_ms": 0.0, "to_gpu_ms": 0.0,
-                      "model_ms": 0.0, "post_ms": 0.0, "sbs_ms": 0.0, "sbs_wait_ms": 0.0, "save_ms": 0.0}
+                      "model_ms": 0.0, "post_ms": 0.0, "sbs_ms": 0.0, "encode_ms": 0.0}
         timing_count = [0]  # 用 list 便于闭包内修改
-        # 每帧各阶段耗时字典：frame_idx -> dict，由各阶段线程写入，sbs_task 收尾汇总
+        # 每帧各阶段耗时字典：frame_idx -> dict，由各阶段写入，主循环编码后收尾汇总
         frame_timings = {}
         frame_timings_lock = threading.Lock()
 
         def _record_and_maybe_summary(frame_idx, final_fields):
-            """sbs_task 收尾时调用：补全该帧所有耗时字段，写 CSV 行，并按 100 帧打印汇总"""
+            """主循环编码后调用：补全该帧所有耗时字段，写 CSV 行，并按 20 帧打印汇总"""
             with frame_timings_lock:
                 d = frame_timings.pop(frame_idx, {})
                 d.update(final_fields)
@@ -547,8 +541,7 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     f"{d.get('model_ms', 0):.1f}",
                     f"{d.get('post_ms', 0):.1f}",
                     f"{d.get('sbs_ms', 0):.1f}",
-                    f"{d.get('sbs_wait_ms', 0):.1f}",
-                    f"{d.get('save_ms', 0):.1f}",
+                    f"{d.get('encode_ms', 0):.1f}",
                 ])
                 timing_file.flush()
                 # 累加汇总
@@ -565,8 +558,7 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                           f"model={timing_acc['model_ms']/n:.0f} "
                           f"post={timing_acc['post_ms']/n:.0f} "
                           f"sbs={timing_acc['sbs_ms']/n:.0f} "
-                          f"sbs_wait={timing_acc['sbs_wait_ms']/n:.0f} "
-                          f"save={timing_acc['save_ms']/n:.0f} (ms/frame)")
+                          f"encode={timing_acc['encode_ms']/n:.0f} (ms/frame)")
 
         print(f"耗时日志将写入: {timing_csv_path}")
 
@@ -588,10 +580,10 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     t0 = time.perf_counter()
                     input_pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     t1 = time.perf_counter()
-                    # 记录该帧读取+预处理耗时（供 sbs_task 汇总）
+                    # 记录该帧读取+预处理耗时（供主循环 _record_and_maybe_summary 汇总）
                     with frame_timings_lock:
                         frame_timings[i] = {"read_ms": (t1 - t0) * 1000}
-                    # 记录入队时刻，供 gpu_worker 计算队列等待
+                    # 记录入队时刻，供主循环计算队列等待
                     gpu_enqueue_t = time.perf_counter()
                     gpu_queue.put((i, input_pil_image, gpu_enqueue_t))
             except Exception as e:
@@ -600,46 +592,62 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                 cap.release()
                 gpu_queue.put(_SENTINEL)  # 通知下游结束
 
-        # ===== 阶段3 单帧任务：SBS 图像落盘（在线程池里并行执行 PNG 编码 + I/O）=====
-        def sbs_task(item):
-            # 队列等待 = 出队时刻 - 入队时刻（反映主线程 GPU 阶段是否供得上落盘）
-            sbs_dequeue_t = time.perf_counter()
-            i, sbs_pil_image, sbs_enqueue_t = item
-            sbs_wait_ms = (sbs_dequeue_t - sbs_enqueue_t) * 1000
-            # 单帧失败不影响整体流程，捕获后跳过该帧
-            save_ms = 0.0
-            try:
-                if sbs_pil_image is not None:
-                    base_name = f"frame_{i:06d}"
-                    t0 = time.perf_counter()
-                    sbs_pil_image.save(os.path.join(frames_sbs_dir, f"sbs_{base_name}.png"))
-                    t1 = time.perf_counter()
-                    save_ms = (t1 - t0) * 1000
-                else:
-                    gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
-            except Exception as e:
-                print(f"Frame {i} save failed: {e}. Skipping.")
-            # 汇总该帧所有耗时并写 CSV（含每 20 帧控制台汇总）
-            _record_and_maybe_summary(i, {"sbs_wait_ms": sbs_wait_ms, "save_ms": save_ms})
-            return i
-
         # ===== 启动流水线（producer 为后台线程负责读帧；GPU 推理在主线程做，MPS 在主线程性能最佳）=====
-        producer_thread = threading.Thread(target=producer_fn, name="frame-producer", daemon=True)
-        producer_thread.start()
-
         actual_frames_processed = 0
-        with ThreadPoolExecutor(max_workers=SBS_WORKERS, thread_name_prefix="sbs") as sbs_pool:
+        sbs_video_no_audio_path = os.path.join(work_parent_dir, "sbs_video_no_audio.mp4")
+        print("使用 VideoToolbox 硬件加速编码视频（SBS 与深度推理并行）...")
+        # 方案A：SBS + 编码放到单后台线程，与主线程深度推理并行（都用 MPS，本次用于实测是否冲突）
+        # sbs_queue 为 FIFO，单消费者天然保证视频帧顺序，无需 reorder 缓存
+        SBS_QUEUE_SIZE = 4
+
+        with imageio.get_writer(sbs_video_no_audio_path, fps=fps, codec='h264_videotoolbox', ffmpeg_params=['-b:v', '8M', '-pix_fmt', 'yuv420p']) as writer:
+            sbs_queue = queue.Queue(maxsize=SBS_QUEUE_SIZE)
+
+            # ===== SBS 后台线程：从 sbs_queue 按 FIFO 顺序做 SBS + 编码（帧顺序天然保证）=====
+            def sbs_worker_fn():
+                nonlocal actual_frames_processed
+                try:
+                    while True:
+                        item = sbs_queue.get()
+                        if item is _SENTINEL:
+                            break
+                        if worker_errors:
+                            continue
+                        i, input_pil_image, depth_pil_image, timing_partial = item
+                        # SBS 生成（GPU，与主线程深度推理并行——本次实测 MPS 多线程是否有效）
+                        t0 = time.perf_counter()
+                        sbs_pil_image = generate_sbs_image_from_depth(
+                            input_pil_image, depth_pil_image, model_name,
+                            sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
+                        )
+                        t1 = time.perf_counter()
+                        sbs_ms = (t1 - t0) * 1000
+                        # 流式编码（VideoToolbox 硬件编码）
+                        encode_ms = 0.0
+                        if sbs_pil_image is not None:
+                            t0 = time.perf_counter()
+                            writer.append_data(np.array(sbs_pil_image))
+                            t1 = time.perf_counter()
+                            encode_ms = (t1 - t0) * 1000
+                            pbar.update(1)
+                            actual_frames_processed += 1
+                        else:
+                            gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
+                        # 汇总该帧耗时（主线程字段已在 timing_partial，这里补 sbs/encode）
+                        timing_partial.update({"sbs_ms": sbs_ms, "encode_ms": encode_ms})
+                        _record_and_maybe_summary(i, timing_partial)
+                except Exception as e:
+                    worker_errors.append(e)
+
             pbar = progress.tqdm(range(target_frame_count), desc="Processing Frames")
-            pending = []  # 已提交但未完成的 SBS future
+            # 启动 producer（读帧）与 sbs_worker（SBS+编码）两个后台线程
+            producer_thread = threading.Thread(target=producer_fn, name="frame-producer", daemon=True)
+            sbs_thread = threading.Thread(target=sbs_worker_fn, name="sbs-worker", daemon=True)
+            producer_thread.start()
+            sbs_thread.start()
             try:
                 while True:
-                    # 收割已完成的落盘 future，及时更新进度
-                    for f in [x for x in pending if x.done()]:
-                        f.result()
-                        pending.remove(f)
-                        pbar.update(1)
-                        actual_frames_processed += 1
-                    # 从 gpu_queue 取一帧；带超时以便期间能收割已完成任务，避免进度条卡顿
+                    # 主线程：从 gpu_queue 取帧 → 深度推理 → 入 sbs_queue（SBS+编码交给后台）
                     try:
                         item = gpu_queue.get(timeout=0.2)
                     except queue.Empty:
@@ -650,8 +658,7 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                         break
                     if worker_errors:
                         continue
-                    # ===== 阶段2：GPU 深度推理 + SBS 生成（在主线程执行：MPS 后端在主线程性能最佳，
-                    # 早期版本把推理放进 daemon 后台线程导致单帧从 0.12s 劣化到 10s+，切勿改回后台线程）=====
+                    # ===== 阶段2：GPU 深度推理（主线程执行：MPS 在主线程性能最佳，切勿改回后台线程）=====
                     gpu_dequeue_t = time.perf_counter()
                     i, input_pil_image, gpu_enqueue_t = item
                     gpu_wait_ms = (gpu_dequeue_t - gpu_enqueue_t) * 1000
@@ -681,33 +688,20 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     # 深度图放大回原始分辨率（深度图是平滑场，放大几乎无质量损失），再用于 SBS
                     if depth_pil_image.size != input_pil_image.size:
                         depth_pil_image = depth_pil_image.resize(input_pil_image.size, Image.Resampling.BILINEAR)
-                    # SBS 生成（内部也会用 GPU，与推理在主线程串行）
-                    t0 = time.perf_counter()
-                    sbs_pil_image = generate_sbs_image_from_depth(
-                        input_pil_image, depth_pil_image, model_name,
-                        sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
-                    )
-                    t1 = time.perf_counter()
-                    sbs_ms = (t1 - t0) * 1000
-                    # 回写本阶段耗时（model/post 细分来自 process_depthmap_image 内部计时）
-                    with frame_timings_lock:
-                        d = frame_timings.get(i, {})
-                        d.update({"gpu_wait_ms": gpu_wait_ms, "to_gpu_ms": to_gpu_ms,
-                                  "model_ms": _LAST_DEPTH_DETAIL["model_ms"],
-                                  "post_ms": _LAST_DEPTH_DETAIL["post_ms"],
-                                  "sbs_ms": sbs_ms})
-                        frame_timings[i] = d
-                    # 提交落盘任务到线程池（记录入队时刻供 sbs_task 计算等待）
-                    sbs_enqueue_t = time.perf_counter()
-                    pending.append(sbs_pool.submit(sbs_task, (i, sbs_pil_image, sbs_enqueue_t)))
-                # 等待所有剩余落盘任务完成
-                for fut in as_completed(pending):
-                    fut.result()
-                    pbar.update(1)
-                    actual_frames_processed += 1
+                    # 主线程测得的 timing（sbs/encode 由 sbs_worker 补全）
+                    timing_partial = {
+                        "gpu_wait_ms": gpu_wait_ms, "to_gpu_ms": to_gpu_ms,
+                        "model_ms": _LAST_DEPTH_DETAIL["model_ms"],
+                        "post_ms": _LAST_DEPTH_DETAIL["post_ms"],
+                    }
+                    # 入 sbs_queue；若 SBS 慢于推理，队列满会阻塞在此形成背压，天然匹配两边速率
+                    sbs_queue.put((i, input_pil_image, depth_pil_image, timing_partial))
+                # 推理结束，通知 sbs_worker 收尾
+                sbs_queue.put(_SENTINEL)
             finally:
-                pbar.close()
                 producer_thread.join(timeout=5)
+                sbs_thread.join(timeout=30)  # 等所有 SBS+编码完成（30s 足够余量）
+                pbar.close()
                 # 打印最终耗时汇总（全部帧的平均值），并关闭 CSV 文件
                 n = timing_count[0]
                 if n > 0:
@@ -718,8 +712,7 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                           f"model={timing_acc['model_ms']/n:.0f} "
                           f"post={timing_acc['post_ms']/n:.0f} "
                           f"sbs={timing_acc['sbs_ms']/n:.0f} "
-                          f"sbs_wait={timing_acc['sbs_wait_ms']/n:.0f} "
-                          f"save={timing_acc['save_ms']/n:.0f} (ms/frame, 平均)")
+                          f"encode={timing_acc['encode_ms']/n:.0f} (ms/frame, 平均)")
                     print(f"[timing-final] 逐帧详细耗时见: {timing_csv_path}")
                 timing_file.close()
 
@@ -731,22 +724,8 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
             gr.Error("No frames could be extracted from the video.")
             return None
 
-        # 6. Assemble SBS Video
-        sbs_frame_files = sorted([os.path.join(frames_sbs_dir, f) for f in os.listdir(frames_sbs_dir) if f.startswith("sbs_") and f.endswith(".png")])
-        
-        if not sbs_frame_files:
-            gr.Error("No SBS frames were generated. Cannot create video.")
-            return None
+        # 6. Assemble SBS Video —— 已在主循环流式编码完成（sbs_video_no_audio_path 由 writer 直接产出）
 
-        sbs_video_no_audio_path = os.path.join(work_parent_dir, "sbs_video_no_audio.mp4")
-        
-        print(f"Assembling SBS video from {len(sbs_frame_files)} frames at {fps} FPS...")
-        print("使用 VideoToolbox 硬件加速编码视频...")
-        # 使用 VideoToolbox 硬件加速
-        with imageio.get_writer(sbs_video_no_audio_path, fps=fps, codec='h264_videotoolbox', ffmpeg_params=['-b:v', '8M', '-pix_fmt', 'yuv420p']) as writer:
-            for sbs_frame_file in progress.tqdm(sbs_frame_files, desc="Assembling Video"):
-                writer.append_data(imageio.imread(sbs_frame_file))
-        
         # 7. Add Audio Back (if extracted)
         if audio_extracted and os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 0:
             print(f"Adding audio back to video: {final_output_video_path}")
