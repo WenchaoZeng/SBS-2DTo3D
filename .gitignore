@@ -172,3 +172,6 @@ output/
 
 *.safetensors
 depth_anything_v2/util/.DS_Store
+
+
+.idea/
