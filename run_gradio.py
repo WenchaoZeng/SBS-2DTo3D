@@ -95,7 +95,7 @@ def load_model(model_name, device, models_dir='models/depthanything'):
 
     return model, dtype, is_metric
 
-def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output_filename_base, output_dir_frames="output"): # Added output_dir_frames with default for backward compatibility if called elsewhere
+def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output_filename_base, output_dir_frames="output", save_to_disk=True): # Added output_dir_frames with default for backward compatibility if called elsewhere
     # performs the core inference, and post-processes the raw depth output by (normalization, resizing), 
     # converts it to a PIL image, and saves it.
 
@@ -166,18 +166,20 @@ def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output
 
     # save the image(s) into the output directory before returning
     # output_dir = "output" # Old hardcoded output
-    os.makedirs(output_dir_frames, exist_ok=True) # Use new parameter
-    
-    # Save grayscale depth map
-    grayscale_path = os.path.join(output_dir_frames, f"{output_filename_base}_depth.png")
-    depth_image.save(grayscale_path)
-    print(f"Saved grayscale depth map to: {grayscale_path}")
-    
-    # Save colored depth map
-    colored_path = os.path.join(output_dir_frames, f"{output_filename_base}_depth_colored.png") # Use new parameter
-    # colored_depth_image.save(colored_path)
-    # print(f"Saved colored depth map to: {colored_path}")
-    
+    # 仅在需要落盘时才创建目录并保存（视频流式处理时 save_to_disk=False，避免每帧 I/O）
+    if save_to_disk:
+        os.makedirs(output_dir_frames, exist_ok=True) # Use new parameter
+
+        # Save grayscale depth map
+        grayscale_path = os.path.join(output_dir_frames, f"{output_filename_base}_depth.png")
+        depth_image.save(grayscale_path)
+        print(f"Saved grayscale depth map to: {grayscale_path}")
+
+        # Save colored depth map
+        colored_path = os.path.join(output_dir_frames, f"{output_filename_base}_depth_colored.png") # Use new parameter
+        # colored_depth_image.save(colored_path)
+        # print(f"Saved colored depth map to: {colored_path}")
+
     return depth_image
 
 def generate_depth_map_only(input_image, model_name):
@@ -416,11 +418,8 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
     os.makedirs("output", exist_ok=True)
     # 中间文件目录与最终输出视频使用同一时间戳，便于对应查看
     work_parent_dir = os.path.join("output", f"sbs_video_{work_timestamp}")
-    frames_orig_dir = os.path.join(work_parent_dir, "frames_orig")
-    frames_depth_dir = os.path.join(work_parent_dir, "frames_depth")
+    # 仅保留 SBS 帧目录（原始帧和深度图帧在内存中流式处理，不再落盘）
     frames_sbs_dir = os.path.join(work_parent_dir, "frames_sbs")
-    os.makedirs(frames_orig_dir, exist_ok=True)
-    os.makedirs(frames_depth_dir, exist_ok=True)
     os.makedirs(frames_sbs_dir, exist_ok=True)
 
     try:
@@ -472,55 +471,46 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         except FileNotFoundError:
             print("ffmpeg/ffprobe not found. Audio will not be processed. Please ensure ffmpeg is installed and in PATH.")
 
-        # 4. Frame Extraction (支持根据起止时间剪切，只抽取目标区间的帧)
-        print(f"Extracting {target_frame_count} frames at {fps} FPS (from frame {clip_start_frame} to {clip_end_frame})...")
+        # 4. 流式处理：逐帧抽取 → 深度推理 → SBS 合成，原始帧与深度图帧只在内存中停留，仅 SBS 帧落盘
+        print(f"Processing {target_frame_count} frames at {fps} FPS (stream, from frame {clip_start_frame} to {clip_end_frame})...")
         # 定位到起始帧，以便只读取需要剪切的范围
         cap.set(cv2.CAP_PROP_POS_FRAMES, clip_start_frame)
-        actual_frames_extracted = 0
-        for i in progress.tqdm(range(target_frame_count), desc="Extracting Frames"):
-            ret, frame = cap.read()
-            if not ret: 
-                print(f"Warning: Could only read {i} frames out of {target_frame_count}.")
-                target_frame_count = i # Adjust frame count if video ends prematurely
-                break
-            cv2.imwrite(os.path.join(frames_orig_dir, f"frame_{i:06d}.png"), frame)
-            actual_frames_extracted += 1
-        cap.release()
 
-        if actual_frames_extracted == 0: # Use actual_frames_extracted
-            gr.Error("No frames could be extracted from the video.")
-            return None
-
-        # 5. Process Each Frame
         transform_normalize = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-        orig_frame_files = sorted([f for f in os.listdir(frames_orig_dir) if f.endswith(".png")])
-        for frame_idx, frame_filename in enumerate(progress.tqdm(orig_frame_files, desc="Processing Frames")):
-            frame_path = os.path.join(frames_orig_dir, frame_filename)
-            base_name = os.path.splitext(frame_filename)[0]
-            
-            input_pil_image = Image.open(frame_path).convert("RGB")
-            
-            # Create a working copy of the input frame for depth processing
-            frame_for_depth_processing = input_pil_image.copy()
+        actual_frames_processed = 0
+        for i in progress.tqdm(range(target_frame_count), desc="Processing Frames"):
+            ret, frame = cap.read()
+            if not ret:
+                print(f"Warning: Could only read {i} frames out of {target_frame_count}.")
+                target_frame_count = i # Adjust frame count if video ends prematurely
+                break
+            # OpenCV 读出为 BGR，转成 RGB 后构造 PIL 图像（等价于原来从 PNG 读取的效果）
+            input_pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            base_name = f"frame_{i:06d}"
 
-            # Depth Map
-            image_tensor = transform_normalize(frame_for_depth_processing).unsqueeze(0).to(device=device, dtype=dtype)
-            # Call modified process_depthmap_image, providing the specific output directory for depth frames
-            depth_pil_image = process_depthmap_image(depth_model, image_tensor, device, dtype, is_metric, base_name, frames_depth_dir) 
-            
-            # SBS Image (downscaled depth maps will be scaled back up to match original image in the sbs.py backend)
+            # Depth Map（视频流式处理不落盘深度图）
+            image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
+            depth_pil_image = process_depthmap_image(depth_model, image_tensor, device, dtype, is_metric, base_name, save_to_disk=False)
+
+            # SBS Image（最终合成视频所需的帧，必须落盘）
             sbs_pil_image = generate_sbs_image_from_depth(
-                input_pil_image, depth_pil_image, model_name, 
+                input_pil_image, depth_pil_image, model_name,
                 sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength
             )
             if sbs_pil_image:
                 sbs_pil_image.save(os.path.join(frames_sbs_dir, f"sbs_{base_name}.png"))
             else:
-                gr.Warning(f"Failed to generate SBS for frame {frame_filename}. Skipping.")
+                gr.Warning(f"Failed to generate SBS for frame {i}. Skipping.")
+            actual_frames_processed += 1
+        cap.release()
+
+        if actual_frames_processed == 0:
+            gr.Error("No frames could be extracted from the video.")
+            return None
 
         # 6. Assemble SBS Video
         sbs_frame_files = sorted([os.path.join(frames_sbs_dir, f) for f in os.listdir(frames_sbs_dir) if f.startswith("sbs_") and f.endswith(".png")])
