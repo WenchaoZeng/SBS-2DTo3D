@@ -396,7 +396,7 @@ def convert_ts_to_mp4(video_path):
         return video_path
 
 
-def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_method, sbs_mode, sbs_depth_scale, sbs_depth_blur_strength, progress=gr.Progress(track_tqdm=True)):
+def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_method, sbs_mode, sbs_depth_scale, sbs_depth_blur_strength, start_time=0, end_time=0, progress=gr.Progress(track_tqdm=True)):
     if not video_path:
         gr.Warning("Please upload a video to process.")
         return None
@@ -443,13 +443,36 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
             fps = 25.0 
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        # 根据用户输入的剪切时间点，计算需要处理的起止帧索引
+        clip_start_frame = 0
+        clip_end_frame = frame_count  # 默认处理到视频结尾
+        if start_time is not None and start_time > 0:
+            clip_start_frame = int(start_time * fps)
+        if end_time is not None and end_time > 0:
+            clip_end_frame = int(end_time * fps)
+        # 边界保护：确保起止帧在合法范围内
+        if clip_start_frame < 0:
+            clip_start_frame = 0
+        if clip_end_frame > frame_count:
+            clip_end_frame = frame_count
+        if clip_start_frame >= clip_end_frame:
+            gr.Error("开始时间必须小于结束时间，请检查输入。")
+            return None
+        target_frame_count = clip_end_frame - clip_start_frame
+        
         temp_audio_path = os.path.join(temp_parent_dir, "audio.aac")
         audio_extracted = False
         try:
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path]
             probe_result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=False)
             if probe_result.returncode == 0 and probe_result.stdout.strip():
-                cmd_extract_audio = ['ffmpeg', '-y', '-i', video_path, '-vn', '-acodec', 'copy', temp_audio_path]
+                # 构造音频提取命令，根据起止时间剪切音频（-ss/-to 放在输入前做快速 seek）
+                cmd_extract_audio = ['ffmpeg', '-y']
+                if start_time is not None and start_time > 0:
+                    cmd_extract_audio += ['-ss', str(start_time)]
+                if end_time is not None and end_time > 0:
+                    cmd_extract_audio += ['-to', str(end_time)]
+                cmd_extract_audio += ['-i', video_path, '-vn', '-acodec', 'copy', temp_audio_path]
                 subprocess.run(cmd_extract_audio, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 audio_extracted = True
                 print("Audio extracted successfully.")
@@ -460,14 +483,16 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
         except FileNotFoundError:
             print("ffmpeg/ffprobe not found. Audio will not be processed. Please ensure ffmpeg is installed and in PATH.")
 
-        # 4. Frame Extraction
-        print(f"Extracting {frame_count} frames at {fps} FPS...")
+        # 4. Frame Extraction (支持根据起止时间剪切，只抽取目标区间的帧)
+        print(f"Extracting {target_frame_count} frames at {fps} FPS (from frame {clip_start_frame} to {clip_end_frame})...")
+        # 定位到起始帧，以便只读取需要剪切的范围
+        cap.set(cv2.CAP_PROP_POS_FRAMES, clip_start_frame)
         actual_frames_extracted = 0
-        for i in progress.tqdm(range(frame_count), desc="Extracting Frames"):
+        for i in progress.tqdm(range(target_frame_count), desc="Extracting Frames"):
             ret, frame = cap.read()
             if not ret: 
-                print(f"Warning: Could only read {i} frames out of {frame_count}.")
-                frame_count = i # Adjust frame count if video ends prematurely
+                print(f"Warning: Could only read {i} frames out of {target_frame_count}.")
+                target_frame_count = i # Adjust frame count if video ends prematurely
                 break
             cv2.imwrite(os.path.join(frames_orig_dir, f"frame_{i:06d}.png"), frame)
             actual_frames_extracted += 1
@@ -582,6 +607,12 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
                 placeholder="请输入视频文件的完整路径，例如: /path/to/video.ts",
                 lines=1
             )
+            # 视频剪切：输入开始/结束时间（秒），留空或填0表示不剪切
+            with gr.Group():
+                gr.Markdown("#### 视频剪切（单位：秒，结束时间为 0 表示到视频结尾）")
+                with gr.Row():
+                    video_start_time = gr.Number(label="开始时间（秒）", value=0, minimum=0, step=0.1)
+                    video_end_time = gr.Number(label="结束时间（秒）", value=0, minimum=0, step=0.1)
         with gr.Column(scale=1):
             model_dropdown_video = gr.Dropdown(
                 choices=AVAILABLE_MODELS,
@@ -614,7 +645,9 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
             sbs_method_video,     
             sbs_mode_video,       
             sbs_depth_scale_video,
-            sbs_depth_blur_strength_video
+            sbs_depth_blur_strength_video,
+            video_start_time,
+            video_end_time
         ],
         outputs=[output_sbs_video_component]
     )
