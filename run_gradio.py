@@ -49,6 +49,9 @@ AVAILABLE_MODELS = [
 #     'depth_anything_v2_vits_fp16.safetensors'        
 # ]
 
+# 最近一次深度处理的细分计时（供视频主循环记录到 timing.csv，诊断 model 推理 vs 后处理瓶颈）
+_LAST_DEPTH_DETAIL = {"model_ms": 0.0, "post_ms": 0.0}
+
 
 # load depth-anything-2 model
 def load_model(model_name, device, models_dir='models/depthanything'):
@@ -123,9 +126,15 @@ def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output
     if device.type == 'cuda': # Reset peak memory stats before inference if using CUDA
         torch.cuda.reset_peak_memory_stats(device)
 
+    # 细分计时：model 推理 vs 后处理（MPS 异步，必须 synchronize 才能准确计时）
     with torch.no_grad():
+        t_model_start = time.perf_counter()
         depth = model(image_tensor)
-        
+        if device.type == 'mps':
+            torch.mps.synchronize()  # MPS 为异步执行，需同步后计时才准确
+        t_model_end = time.perf_counter()
+    _LAST_DEPTH_DETAIL["model_ms"] = (t_model_end - t_model_start) * 1000
+
     end_time = time.time()
     print(f"Inference took {end_time - start_time:.2f} seconds")
 
@@ -136,6 +145,7 @@ def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output
         # print(f"Peak GPU Memory Allocated during inference: {peak_memory_mib:.2f} MiB ({peak_memory_gib:.2f} GiB)")
 
     # Postprocessing
+    t_post_start = time.perf_counter()
     depth = depth.squeeze(0).squeeze(0) # Remove batch (dim 0) and channel (dim 0 again after first squeeze) -> (H, W)
     depth = (depth - depth.min()) / (depth.max() - depth.min()) # Normalize to 0-1 -> (H, W)
 
@@ -153,9 +163,18 @@ def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output
     if is_metric:
         depth = 1.0 - depth # Invert for metric models
 
-    # Convert to numpy array and scale to 0-255
+    # Convert to numpy array and scale to 0-255（.cpu() 会触发 GPU→CPU 同步）
     depth_np = depth.cpu().numpy()
+    if device.type == 'mps':
+        torch.mps.synchronize()
     depth_visual = (depth_np * 255).astype(np.uint8)
+    _LAST_DEPTH_DETAIL["post_ms"] = (time.perf_counter() - t_post_start) * 1000
+
+    # 每帧推理后主动清理 GPU 缓存，防止长视频内存累积导致越来越慢（MPS 尤其敏感）
+    if device.type == 'mps':
+        torch.mps.empty_cache()
+    elif device.type == 'cuda':
+        torch.cuda.empty_cache()
 
     # Create PIL image (grayscale)
     depth_image = Image.fromarray(depth_visual)
@@ -501,11 +520,11 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         timing_csv_path = os.path.join(work_parent_dir, "timing.csv")
         timing_file = open(timing_csv_path, "w", newline="")
         timing_writer = csv.writer(timing_file)
-        timing_writer.writerow(["frame", "read_ms", "gpu_wait_ms", "to_gpu_ms", "infer_ms", "sbs_ms", "sbs_wait_ms", "save_ms"])
+        timing_writer.writerow(["frame", "read_ms", "gpu_wait_ms", "to_gpu_ms", "model_ms", "post_ms", "sbs_ms", "sbs_wait_ms", "save_ms"])
         timing_file.flush()
-        # 各阶段累计耗时（用于每 100 帧汇总打印），key 与 CSV 列名对应
+        # 各阶段累计耗时（用于每 20 帧汇总打印），key 与 CSV 列名对应
         timing_acc = {"read_ms": 0.0, "gpu_wait_ms": 0.0, "to_gpu_ms": 0.0,
-                      "infer_ms": 0.0, "sbs_ms": 0.0, "sbs_wait_ms": 0.0, "save_ms": 0.0}
+                      "model_ms": 0.0, "post_ms": 0.0, "sbs_ms": 0.0, "sbs_wait_ms": 0.0, "save_ms": 0.0}
         timing_count = [0]  # 用 list 便于闭包内修改
         # 每帧各阶段耗时字典：frame_idx -> dict，由各阶段线程写入，sbs_task 收尾汇总
         frame_timings = {}
@@ -521,7 +540,8 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     f"{d.get('read_ms', 0):.1f}",
                     f"{d.get('gpu_wait_ms', 0):.1f}",
                     f"{d.get('to_gpu_ms', 0):.1f}",
-                    f"{d.get('infer_ms', 0):.1f}",
+                    f"{d.get('model_ms', 0):.1f}",
+                    f"{d.get('post_ms', 0):.1f}",
                     f"{d.get('sbs_ms', 0):.1f}",
                     f"{d.get('sbs_wait_ms', 0):.1f}",
                     f"{d.get('save_ms', 0):.1f}",
@@ -538,7 +558,8 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                           f"read={timing_acc['read_ms']/n:.0f} "
                           f"gpu_wait={timing_acc['gpu_wait_ms']/n:.0f} "
                           f"to_gpu={timing_acc['to_gpu_ms']/n:.0f} "
-                          f"infer={timing_acc['infer_ms']/n:.0f} "
+                          f"model={timing_acc['model_ms']/n:.0f} "
+                          f"post={timing_acc['post_ms']/n:.0f} "
                           f"sbs={timing_acc['sbs_ms']/n:.0f} "
                           f"sbs_wait={timing_acc['sbs_wait_ms']/n:.0f} "
                           f"save={timing_acc['save_ms']/n:.0f} (ms/frame)")
@@ -631,19 +652,16 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     i, input_pil_image, gpu_enqueue_t = item
                     gpu_wait_ms = (gpu_dequeue_t - gpu_enqueue_t) * 1000
                     base_name = f"frame_{i:06d}"
-                    # 深度推理：normalize + 上 GPU
+                    # 深度推理：normalize + 上 GPU（to_gpu_ms 仅测数据上 GPU，推理耗时由 model_ms/post_ms 细分体现）
                     t0 = time.perf_counter()
                     image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
                     t1 = time.perf_counter()
                     to_gpu_ms = (t1 - t0) * 1000
-                    # 模型推理
-                    t0 = time.perf_counter()
+                    # 模型推理（内部已做 mps.synchronize + empty_cache，并把 model/post 细分计时写入 _LAST_DEPTH_DETAIL）
                     depth_pil_image = process_depthmap_image(
                         depth_model, image_tensor, device, dtype, is_metric,
                         base_name, save_to_disk=False
                     )
-                    t1 = time.perf_counter()
-                    infer_ms = (t1 - t0) * 1000
                     # SBS 生成（内部也会用 GPU，与推理在主线程串行）
                     t0 = time.perf_counter()
                     sbs_pil_image = generate_sbs_image_from_depth(
@@ -652,11 +670,13 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     )
                     t1 = time.perf_counter()
                     sbs_ms = (t1 - t0) * 1000
-                    # 回写本阶段耗时
+                    # 回写本阶段耗时（model/post 细分来自 process_depthmap_image 内部计时）
                     with frame_timings_lock:
                         d = frame_timings.get(i, {})
                         d.update({"gpu_wait_ms": gpu_wait_ms, "to_gpu_ms": to_gpu_ms,
-                                  "infer_ms": infer_ms, "sbs_ms": sbs_ms})
+                                  "model_ms": _LAST_DEPTH_DETAIL["model_ms"],
+                                  "post_ms": _LAST_DEPTH_DETAIL["post_ms"],
+                                  "sbs_ms": sbs_ms})
                         frame_timings[i] = d
                     # 提交落盘任务到线程池（记录入队时刻供 sbs_task 计算等待）
                     sbs_enqueue_t = time.perf_counter()
@@ -676,7 +696,8 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                           f"read={timing_acc['read_ms']/n:.0f} "
                           f"gpu_wait={timing_acc['gpu_wait_ms']/n:.0f} "
                           f"to_gpu={timing_acc['to_gpu_ms']/n:.0f} "
-                          f"infer={timing_acc['infer_ms']/n:.0f} "
+                          f"model={timing_acc['model_ms']/n:.0f} "
+                          f"post={timing_acc['post_ms']/n:.0f} "
                           f"sbs={timing_acc['sbs_ms']/n:.0f} "
                           f"sbs_wait={timing_acc['sbs_wait_ms']/n:.0f} "
                           f"save={timing_acc['save_ms']/n:.0f} (ms/frame, 平均)")
