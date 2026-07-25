@@ -357,7 +357,8 @@ def generate_depth_and_sbs_combined(input_image, model_name, depthmap_input_scal
 
 def convert_ts_to_mp4(video_path):
     """
-    将 TS 格式视频（包括 .ts, .mts, .m2ts）转换为 MP4 格式，以便 OpenCV 能正常读取。
+    将 TS 格式视频转换为 MP4 格式，以便 OpenCV 能正常读取。
+    使用 VideoToolbox 硬件加速。
     返回转换后的 MP4 文件路径；如果转换失败则返回原始路径。
     """
     # 检查文件扩展名是否为 TS 格式
@@ -369,17 +370,17 @@ def convert_ts_to_mp4(video_path):
     mp4_path = os.path.splitext(video_path)[0] + ".mp4"
 
     try:
-        # 使用 FFmpeg 将 TS 转换为 MP4，使用 H.264 编码
+        # macOS 使用 VideoToolbox 硬件加速
         cmd = [
             'ffmpeg', '-y',
             '-i', video_path,
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
+            '-c:v', 'h264_videotoolbox',
+            '-b:v', '8M',
             '-c:a', 'aac',
             '-movflags', '+faststart',
             mp4_path
         ]
+        print("使用 VideoToolbox 硬件加速编码...")
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         print(f"TS 视频已成功转换为: {mp4_path}")
         return mp4_path
@@ -527,7 +528,9 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
         sbs_video_no_audio_path = os.path.join(temp_parent_dir, "sbs_video_no_audio.mp4")
         
         print(f"Assembling SBS video from {len(sbs_frame_files)} frames at {fps} FPS...")
-        with imageio.get_writer(sbs_video_no_audio_path, fps=fps, codec='libx264', ffmpeg_params=['-preset', 'medium', '-crf', '23', '-pix_fmt', 'yuv420p']) as writer:
+        print("使用 VideoToolbox 硬件加速编码视频...")
+        # 使用 VideoToolbox 硬件加速
+        with imageio.get_writer(sbs_video_no_audio_path, fps=fps, codec='h264_videotoolbox', ffmpeg_params=['-b:v', '8M', '-pix_fmt', 'yuv420p']) as writer:
             for sbs_frame_file in progress.tqdm(sbs_frame_files, desc="Assembling Video"):
                 writer.append_data(imageio.imread(sbs_frame_file))
         
@@ -566,122 +569,38 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
     
     gr.Markdown("## SBS 2D To 3D Converter")
 
-    with gr.Tabs():
-        with gr.Tab("Image"):
-            
-            gr.Markdown("Upload an image, generate its depth map, then generate the 3D SBS image.")
-            
-            with gr.Row():
-                with gr.Column(scale=1):
-                    input_image_component = gr.Image(label="Input Image", type="pil", height=492)
-                    
-                with gr.Column(scale=1):
-                    output_grayscale_component = gr.Image(label="Generated Depth Map", type="pil", height=492, interactive=False) # Depth map is output here
-                    
-                with gr.Column(scale=1):                    
-                    model_dropdown_component = gr.Dropdown(
-                        choices=AVAILABLE_MODELS,
-                        label="Select Model (for Depth Map)",
-                        value=AVAILABLE_MODELS[4] if len(AVAILABLE_MODELS) > 4 else (AVAILABLE_MODELS[0] if AVAILABLE_MODELS else None) # Default to vitl_fp16
-                    )
-                    depthmap_input_scale = gr.Slider(minimum=0.10, maximum=1.00, value=0.75, step=0.01, label="Depth Map Input Scale")
+    gr.Markdown("输入视频文件路径进行处理（支持 MP4, AVI, MOV, MKV, TS 等格式）")
+    with gr.Row():
+        with gr.Column(scale=1):
+            # 使用文本框直接输入视频文件路径
+            video_input_component = gr.Textbox(
+                label="视频文件路径",
+                placeholder="请输入视频文件的完整路径，例如: /path/to/video.ts",
+                lines=1
+            )
+        with gr.Column(scale=1):
+            model_dropdown_video = gr.Dropdown(
+                choices=AVAILABLE_MODELS,
+                label="Select Model (for Depth Map)",
+                value=AVAILABLE_MODELS[4] if len(AVAILABLE_MODELS) > 4 else (AVAILABLE_MODELS[0] if AVAILABLE_MODELS else None)
+            )
+            depthmap_frame_input_scale = gr.Slider(minimum=0.10, maximum=1.00, value=0.75, step=0.01, label="Depth Map Input Scale")
 
-
-                    with gr.Group():
-                        gr.Markdown("#### SBS 3D Parameters")
-                        with gr.Row():
-                            sbs_method_image = gr.Dropdown(choices=["mesh_warping", "grid_sampling"], value="mesh_warping", label="SBS Method")        
-                            sbs_mode_image = gr.Dropdown(choices=["parallel", "cross-eyed"], value="parallel", label="SBS View Mode")
-                        
-                        sbs_depth_scale_image = gr.Slider(minimum=1, maximum=150, value=40, step=1, label="SBS Depth Scale")
-                        sbs_depth_blur_strength_image = gr.Slider(minimum=1, maximum=15, value=7, step=2, label="SBS Depth Blur Strength")
-                    generate_sbs_button = gr.Button("Generate SBS 3D Image", variant="primary") # UPDATED TEXT
-
-            with gr.Row():
-                output_sbs_component = gr.Image(type="pil", label="Generated SBS 3D Image", height=480, interactive=False)
-        
-        with gr.Tab("Video"):
-            gr.Markdown("输入视频文件路径进行处理（支持 MP4, AVI, MOV, MKV, TS 等格式）")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    # 使用文本框直接输入视频文件路径
-                    video_input_component = gr.Textbox(
-                        label="视频文件路径",
-                        placeholder="请输入视频文件的完整路径，例如: /path/to/video.ts",
-                        lines=1
-                    )
-                with gr.Column(scale=1):
-                    model_dropdown_video = gr.Dropdown( # Renamed
-                        choices=AVAILABLE_MODELS,
-                        label="Select Model (for Depth Map)",
-                        value=AVAILABLE_MODELS[4] if len(AVAILABLE_MODELS) > 4 else (AVAILABLE_MODELS[0] if AVAILABLE_MODELS else None) # Default to vitl_fp16
-                    )
-                    depthmap_frame_input_scale = gr.Slider(minimum=0.10, maximum=1.00, value=0.75, step=0.01, label="Depth Map Input Scale")
-
-                    with gr.Group():
-                        gr.Markdown("#### SBS 3D Parameters")
-                        with gr.Row():
-                            sbs_method_video = gr.Dropdown(choices=["mesh_warping", "grid_sampling"], value="mesh_warping", label="SBS Method") # Renamed       
-                            sbs_mode_video = gr.Dropdown(choices=["parallel", "cross-eyed"], value="parallel", label="SBS View Mode") # Renamed
-                        sbs_depth_scale_video = gr.Slider(minimum=1, maximum=150, value=40, step=1, label="SBS Depth Scale") # Renamed
-                        sbs_depth_blur_strength_video = gr.Slider(minimum=1, maximum=15, value=7, step=2, label="SBS Depth Blur Strength (Odd Values)") # Renamed
-                    process_video_button = gr.Button("Process SBS 3D Video", variant="primary")
-            
-            with gr.Row():
-                # show result of the merged sbs video
-                output_sbs_video_component = gr.Video(label="Generated SBS 3D Video", interactive=False) # Defined
-
-        gr.Markdown(
-            """
-        | **Parameter** | **Description** |
-        |---------------|-----------------|
-        | `Model` | Selects the Depth Anything V2 model for depth map generation. Different models (VITS (small), VITB (base), VITL (large)) offer trade-offs in speed and accuracy. <br> If it does not exist, it will download the selected model into the directory `models/depthanything`. The default `...vitl-fp16` variant is approx 600MB. |
-        | `Depth Map Input Scale` | Downscales a copy of the image or video frame for generating the depth map. The original image or frame is unchanged. <br><br> At 100% (1.0), the depth map is generated at the same size as the input image or video frame. <br> Creating depth maps from large input images can be memory intensive. <br>Images larger than say, `1280x1280` (1.6MP) should be downscaled before being passed to the depth estimation model. <br> When generating the SBS output, the generated depth map will then be scaled back up to match the original image's resolution. <br> Remember that depth maps are about relative distances, not fine details. This means that:<br><br>- Lower-resolution depth maps (like `512x512` or `1024x1024`) still preserve useful spatial information.<br>- Downscaling the input image before depth generation not only reduces VRAM usage, but when scaled back up, can also smooth the depth map — often improving the final 3D/parallax effect. |
-        | `SBS Method` | The algorithm used to generate the Side-by-Side 3D image from the depth map. <br> - `mesh_warping`: Warps the image based on a 3D mesh derived from the depth map. Generally provides good results. <br> - `grid_sampling`: Samples pixels from the original image based on a grid distorted by the depth map. Can be faster but might produce different visual artifacts. |
-        | `SBS View Mode` | Determines the arrangement of the left and right eye views in the SBS image. <br> - `parallel`: Left eye view on the left, right eye view on the right. Suitable for parallel viewing. <br> - `cross-eyed`: Right eye view on the left, left eye view on the right. Suitable for cross-eyed viewing. <br><br> - *Cross-eyed mode is primarily used for viewing stereoscopic 3D images on a regular 2D screen without needing any special equipment. <br> With Parallel, the left-eye image feeds the left eye, and the right-eye image feeds the right eye. <br> But with Cross-eyed, this is flipped it places the left-eye image on the right side and the right-eye image on the left side. <br> When you cross your eyes, each eye ends up looking at the correct image, and your brain fuses them into a 3D image which will appear centered. <br> If done correctly, that middle image will appear 3D without the need for a VR headset or 3D glasses.*|
-        | `SBS Depth Scale` | Controls the intensity of the 3D effect. Higher values increase the perceived depth and separation between foreground and background elements (for portraits, you may get very long, pointy noses at high values). Range: 1-150. |
-        | `SBS Depth Blur Strength` | Applies a blur to the depth map before SBS generation. This can help smooth out artifacts in the depth map and create a softer 3D effect. Must be an odd number. Range: 1-15. |
-
-        """
-        )
-    # ========================================
-    # IMAGE EVENT HANDLERS
-    # ========================================
-    # Click handler for generating depth map
-    # generate_depth_map_button.click(
-    #     fn=generate_depth_map_only,
-    #     inputs=[
-    #         input_image_component, 
-    #         model_dropdown_component
-    #     ],
-    #     outputs=[output_grayscale_component]
-    # )
-
-    # Click handler for generating SBS image
-    generate_sbs_button.click(
-        fn=generate_depth_and_sbs_combined,
-        inputs=[
-            input_image_component,         # Original image
-            model_dropdown_component,      # Model name
-            depthmap_input_scale,
-            sbs_method_image,
-            sbs_depth_scale_image,
-            sbs_mode_image,
-            sbs_depth_blur_strength_image
-        ],
-        outputs=[output_grayscale_component, output_sbs_component]
-    )
+            with gr.Group():
+                gr.Markdown("#### SBS 3D Parameters")
+                with gr.Row():
+                    sbs_method_video = gr.Dropdown(choices=["mesh_warping", "grid_sampling"], value="mesh_warping", label="SBS Method")       
+                    sbs_mode_video = gr.Dropdown(choices=["parallel", "cross-eyed"], value="parallel", label="SBS View Mode")
+                sbs_depth_scale_video = gr.Slider(minimum=1, maximum=150, value=40, step=1, label="SBS Depth Scale")
+                sbs_depth_blur_strength_video = gr.Slider(minimum=1, maximum=15, value=7, step=2, label="SBS Depth Blur Strength (Odd Values)")
+            process_video_button = gr.Button("Process SBS 3D Video", variant="primary")
+    
+    with gr.Row():
+        output_sbs_video_component = gr.Video(label="Generated SBS 3D Video", interactive=False)
 
     # ========================================
-    # VIDEO EVENT HANDLERS
+    # EVENT HANDLERS
     # ========================================
-
-
-    # uses imageio-ffmpeg
-    # we need to extract frames from the video (temp dir)
-    # produce a depthmap for each from save depth map (temp dir)
-    # produce sbs image for each frame, 
-    # combine all frames back together to a video (includ audio if original had audio)
     process_video_button.click(
         fn=generate_sbs_video,
         inputs=[
@@ -698,50 +617,3 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
 
 if __name__ == "__main__":
     demo.launch()
-
-
-"""
-Image Processing Path
-===========================
-
-generate_sbs_button.click()
-└── generate_depth_and_sbs_combined()
-    ├── generate_depth_map_only()
-    │   ├── load_model()
-    │   │   ├── hf_hub_download() [if model not cached]
-    │   │   ├── load_safetensors()
-    │   │   └── DepthAnythingV2() [model initialization]
-    │   └── process_depthmap_image()
-    │       ├── F.interpolate() [resize to multiple of 14]
-    │       ├── model() [inference]
-    │       ├── depth normalization & post-processing
-    │       └── Image.fromarray() [convert to PIL]
-    └── generate_sbs_image_from_depth()
-        └── process_image_sbs() [from sbs.sbs module]
-
-Video Processing Path
-===========================
-
-process_video_button.click()
-└── generate_sbs_video()
-    ├── load_model()
-    │   ├── hf_hub_download() [if model not cached]
-    │   ├── load_safetensors()
-    │   └── DepthAnythingV2() [model initialization]
-    ├── tempfile.mkdtemp() [create temp directories]
-    ├── cv2.VideoCapture() [video info extraction]
-    ├── subprocess.run() [ffmpeg audio extraction]
-    ├── Frame Extraction Loop:
-    │   └── cv2.imwrite() [save each frame as PNG]
-    ├── Frame Processing Loop (for each frame):
-    │   ├── process_depthmap_image()
-    │   │   ├── F.interpolate() [resize to multiple of 14]
-    │   │   ├── model() [inference]
-    │   │   ├── depth normalization & post-processing
-    │   │   └── Image.fromarray() [convert to PIL]
-    │   └── generate_sbs_image_from_depth()
-    │       └── process_image_sbs() [from sbs.sbs module]
-    ├── imageio.get_writer() [assemble video from SBS frames]
-    ├── subprocess.run() [ffmpeg audio muxing]
-    └── shutil.rmtree() [cleanup temp directories]
-"""
