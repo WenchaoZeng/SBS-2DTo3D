@@ -504,9 +504,9 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
 
         # ===== 流水线配置 =====
         # 模型输入最长边上限：vitl 处理 1080p 会产生 ~1万 token，self-attention O(n²) 极慢（~10s/帧）。
-        # 仅缩放"喂给模型"的输入到最长边 768（token 数降 ~5 倍，attention 计算量降 ~25 倍），
+        # 仅缩放"喂给模型"的输入到最长边 640（token 数降 ~6 倍，attention 计算量降 ~40 倍），
         # 深度图生成后再放大回原始分辨率做 SBS，最终输出仍是原始分辨率，视觉质量几乎无损。
-        MAX_MODEL_SIDE = 768
+        MAX_MODEL_SIDE = 640
         # 阶段1→2 队列：缓存放送 GPU 的待推理帧（PIL 图像，受内存约束不宜过大）
         GPU_QUEUE_SIZE = 2
         # 阶段2→3 队列：缓存放待落盘的 SBS 图像（SBS 图宽度为原图 2 倍，体积较大）
@@ -800,7 +800,7 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
             model_dropdown_video = gr.Dropdown(
                 choices=AVAILABLE_MODELS,
                 label="Select Model (for Depth Map)",
-                value=AVAILABLE_MODELS[4] if len(AVAILABLE_MODELS) > 4 else (AVAILABLE_MODELS[0] if AVAILABLE_MODELS else None)
+                value=AVAILABLE_MODELS[0] if AVAILABLE_MODELS else None  # 默认 vits（小模型），推理最快
             )
 
             with gr.Group():
