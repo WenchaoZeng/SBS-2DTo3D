@@ -180,7 +180,7 @@ def process_depthmap_image(model, image_tensor, device, dtype, is_metric, output
     
     return depth_image
 
-def generate_depth_map_only(input_image, depthmap_input_scale, model_name):
+def generate_depth_map_only(input_image, model_name):
     """
     Generates only the depth map from the input image.
     called by generate_depth_and_sbs_combined()
@@ -213,23 +213,6 @@ def generate_depth_map_only(input_image, depthmap_input_scale, model_name):
 
     # Create a working copy of the input image for depth processing
     image_for_depth_processing = input_image.copy()
-
-    # Apply downscaling if depthmap_input_scale is less than 1.0 (100%)
-    if depthmap_input_scale < 1.0:
-        original_width, original_height = image_for_depth_processing.size
-        new_width = int(original_width * depthmap_input_scale)
-        new_height = int(original_height * depthmap_input_scale)
-
-        # Ensure dimensions are at least 1 pixel
-        new_width = max(1, new_width)
-        new_height = max(1, new_height)
-
-        print(f"Downscaling copy of image for depth map from {original_width}x{original_height} to {new_width}x{new_height} ({depthmap_input_scale*100:.0f}%)")
-        image_for_depth_processing = image_for_depth_processing.resize((new_width, new_height), Image.Resampling.BICUBIC)
-    
-    # Now, image_for_depth_processing is the (potentially) downscaled image.
-    # The rest of the function should use this variable.
-
 
     # Preprocessing
     transform_normalize = transforms.Compose([
@@ -330,12 +313,12 @@ def generate_sbs_image_from_depth(original_input_image, depth_map_pil, model_nam
         return None
 
 
-def generate_depth_and_sbs_combined(input_image, model_name, depthmap_input_scale, sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength):
+def generate_depth_and_sbs_combined(input_image, model_name, sbs_method, sbs_depth_scale, sbs_mode, sbs_depth_blur_strength):
     """Combined function that generates depth map and then SBS image in sequence."""
     
     # Step 1: Generate depth map
     print("Step 1: Generating depth map...")
-    depth_map = generate_depth_map_only(input_image,depthmap_input_scale, model_name)
+    depth_map = generate_depth_map_only(input_image, model_name)
     
     if depth_map is None:
         return None, None  # Return None for both outputs if depth map generation fails
@@ -373,6 +356,11 @@ def convert_ts_to_mp4(video_path):
     filename = os.path.splitext(os.path.basename(video_path))[0] + ".mp4"
     mp4_path = os.path.join("output", filename)
 
+    # 如果目标 MP4 文件已存在（且非空），则直接复用，跳过重复转换
+    if os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
+        print(f"已存在转换后的 MP4 文件，跳过转换：{mp4_path}")
+        return mp4_path
+
     try:
         # macOS 使用 VideoToolbox 硬件加速
         cmd = [
@@ -396,7 +384,7 @@ def convert_ts_to_mp4(video_path):
         return video_path
 
 
-def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_method, sbs_mode, sbs_depth_scale, sbs_depth_blur_strength, start_time=0, end_time=0, progress=gr.Progress(track_tqdm=True)):
+def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_scale, sbs_depth_blur_strength, start_time=0, end_time=0, progress=gr.Progress(track_tqdm=True)):
     if not video_path:
         gr.Warning("Please upload a video to process.")
         return None
@@ -519,20 +507,6 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
             # Create a working copy of the input frame for depth processing
             frame_for_depth_processing = input_pil_image.copy()
 
-            # Apply downscaling if depthmap_frame_input_scale is less than 1.0 (100%)
-            if depthmap_frame_input_scale < 1.0:
-                original_width, original_height = frame_for_depth_processing.size
-                new_width = int(original_width * depthmap_frame_input_scale)
-                new_height = int(original_height * depthmap_frame_input_scale)
-
-                # Ensure dimensions are at least 1 pixel
-                new_width = max(1, new_width)
-                new_height = max(1, new_height)
-
-                print(f"Downscaling frame copy for depth map from {original_width}x{original_height} to {new_width}x{new_height} ({depthmap_frame_input_scale*100:.0f}%)")
-                # Using BICUBIC to match your previous implementation for single images
-                frame_for_depth_processing = frame_for_depth_processing.resize((new_width, new_height), Image.Resampling.BICUBIC)
-            
             # Depth Map
             image_tensor = transform_normalize(frame_for_depth_processing).unsqueeze(0).to(device=device, dtype=dtype)
             # Call modified process_depthmap_image, providing the specific output directory for depth frames
@@ -619,7 +593,6 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
                 label="Select Model (for Depth Map)",
                 value=AVAILABLE_MODELS[4] if len(AVAILABLE_MODELS) > 4 else (AVAILABLE_MODELS[0] if AVAILABLE_MODELS else None)
             )
-            depthmap_frame_input_scale = gr.Slider(minimum=0.10, maximum=1.00, value=0.75, step=0.01, label="Depth Map Input Scale")
 
             with gr.Group():
                 gr.Markdown("#### SBS 3D Parameters")
@@ -641,8 +614,7 @@ with gr.Blocks(title="SBS 2D To 3D") as demo:
         inputs=[
             video_input_component,
             model_dropdown_video,
-            depthmap_frame_input_scale,  
-            sbs_method_video,     
+            sbs_method_video,
             sbs_mode_video,       
             sbs_depth_scale_video,
             sbs_depth_blur_strength_video,
