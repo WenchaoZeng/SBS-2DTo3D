@@ -421,18 +421,19 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
         gr.Error(f"Failed to load model: {e}")
         return None
 
-    # 2. Create Temporary Directories
-    temp_parent_dir = tempfile.mkdtemp(prefix="sbs_video_")
-    frames_orig_dir = os.path.join(temp_parent_dir, "frames_orig")
-    frames_depth_dir = os.path.join(temp_parent_dir, "frames_depth")
-    frames_sbs_dir = os.path.join(temp_parent_dir, "frames_sbs")
+    # 2. Create Working Directories (所有中间文件保存在 output 目录下，便于查看)
+    work_timestamp = time.strftime('%Y%m%d_%H%M%S')
+    output_video_base_name = f"sbs_video_{work_timestamp}.mp4"
+    final_output_video_path = os.path.join("output", output_video_base_name) # Ensure "output" dir exists
+    os.makedirs("output", exist_ok=True)
+    # 中间文件目录与最终输出视频使用同一时间戳，便于对应查看
+    work_parent_dir = os.path.join("output", f"sbs_video_{work_timestamp}")
+    frames_orig_dir = os.path.join(work_parent_dir, "frames_orig")
+    frames_depth_dir = os.path.join(work_parent_dir, "frames_depth")
+    frames_sbs_dir = os.path.join(work_parent_dir, "frames_sbs")
     os.makedirs(frames_orig_dir, exist_ok=True)
     os.makedirs(frames_depth_dir, exist_ok=True)
     os.makedirs(frames_sbs_dir, exist_ok=True)
-
-    output_video_base_name = f"sbs_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
-    final_output_video_path = os.path.join("output", output_video_base_name) # Ensure "output" dir exists
-    os.makedirs("output", exist_ok=True)
 
     try:
         # 3. Video Info & Audio Extraction
@@ -460,7 +461,7 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
             return None
         target_frame_count = clip_end_frame - clip_start_frame
         
-        temp_audio_path = os.path.join(temp_parent_dir, "audio.aac")
+        temp_audio_path = os.path.join(work_parent_dir, "audio.aac")
         audio_extracted = False
         try:
             ffprobe_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path]
@@ -554,7 +555,7 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
             gr.Error("No SBS frames were generated. Cannot create video.")
             return None
 
-        sbs_video_no_audio_path = os.path.join(temp_parent_dir, "sbs_video_no_audio.mp4")
+        sbs_video_no_audio_path = os.path.join(work_parent_dir, "sbs_video_no_audio.mp4")
         
         print(f"Assembling SBS video from {len(sbs_frame_files)} frames at {fps} FPS...")
         print("使用 VideoToolbox 硬件加速编码视频...")
@@ -587,10 +588,9 @@ def generate_sbs_video(video_path, model_name, depthmap_frame_input_scale, sbs_m
         traceback.print_exc()
         return None
     finally:
-        # 8. Cleanup
-        if os.path.exists(temp_parent_dir):
-            print(f"Cleaning up temporary directory: {temp_parent_dir}")
-            shutil.rmtree(temp_parent_dir)
+        # 8. 保留中间文件（已保存到 output 目录），便于查看与排查
+        if os.path.exists(work_parent_dir):
+            print(f"中间文件已保存到: {work_parent_dir}")
 
 # ================================================
 # GRADIO UI
