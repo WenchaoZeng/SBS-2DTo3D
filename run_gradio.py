@@ -503,6 +503,10 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
         ])
 
         # ===== 流水线配置 =====
+        # 模型输入最长边上限：vitl 处理 1080p 会产生 ~1万 token，self-attention O(n²) 极慢（~10s/帧）。
+        # 仅缩放"喂给模型"的输入到最长边 768（token 数降 ~5 倍，attention 计算量降 ~25 倍），
+        # 深度图生成后再放大回原始分辨率做 SBS，最终输出仍是原始分辨率，视觉质量几乎无损。
+        MAX_MODEL_SIDE = 768
         # 阶段1→2 队列：缓存放送 GPU 的待推理帧（PIL 图像，受内存约束不宜过大）
         GPU_QUEUE_SIZE = 2
         # 阶段2→3 队列：缓存放待落盘的 SBS 图像（SBS 图宽度为原图 2 倍，体积较大）
@@ -652,9 +656,21 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                     i, input_pil_image, gpu_enqueue_t = item
                     gpu_wait_ms = (gpu_dequeue_t - gpu_enqueue_t) * 1000
                     base_name = f"frame_{i:06d}"
+
+                    # 模型输入降采样：把"喂给模型"的图按最长边缩到 MAX_MODEL_SIDE（保持宽高比），
+                    # 原图 input_pil_image 保留，用于 SBS 与最终输出。深度图生成后再放大回原尺寸。
+                    orig_w, orig_h = input_pil_image.size
+                    longest = max(orig_w, orig_h)
+                    if longest > MAX_MODEL_SIDE:
+                        scale = MAX_MODEL_SIDE / longest
+                        model_w, model_h = int(orig_w * scale), int(orig_h * scale)
+                        model_input_pil = input_pil_image.resize((model_w, model_h), Image.Resampling.BILINEAR)
+                    else:
+                        model_input_pil = input_pil_image
+
                     # 深度推理：normalize + 上 GPU（to_gpu_ms 仅测数据上 GPU，推理耗时由 model_ms/post_ms 细分体现）
                     t0 = time.perf_counter()
-                    image_tensor = transform_normalize(input_pil_image).unsqueeze(0).to(device=device, dtype=dtype)
+                    image_tensor = transform_normalize(model_input_pil).unsqueeze(0).to(device=device, dtype=dtype)
                     t1 = time.perf_counter()
                     to_gpu_ms = (t1 - t0) * 1000
                     # 模型推理（内部已做 mps.synchronize + empty_cache，并把 model/post 细分计时写入 _LAST_DEPTH_DETAIL）
@@ -662,6 +678,9 @@ def generate_sbs_video(video_path, model_name, sbs_method, sbs_mode, sbs_depth_s
                         depth_model, image_tensor, device, dtype, is_metric,
                         base_name, save_to_disk=False
                     )
+                    # 深度图放大回原始分辨率（深度图是平滑场，放大几乎无质量损失），再用于 SBS
+                    if depth_pil_image.size != input_pil_image.size:
+                        depth_pil_image = depth_pil_image.resize(input_pil_image.size, Image.Resampling.BILINEAR)
                     # SBS 生成（内部也会用 GPU，与推理在主线程串行）
                     t0 = time.perf_counter()
                     sbs_pil_image = generate_sbs_image_from_depth(
