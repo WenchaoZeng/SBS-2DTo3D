@@ -4,7 +4,6 @@ import argparse
 import json
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -134,33 +133,37 @@ def process_video(input_path: str | Path, multiplier: int, enable_interpolation:
             raise RuntimeError("无法解码输入视频的首帧。") from error
     height, width = previous_frame.shape[:2]
     output_fps = source_fps * multiplier if enable_interpolation else source_fps
-    with tempfile.TemporaryDirectory(prefix="rife_") as temporary_directory:
-        silent_video = Path(temporary_directory) / "video.mp4"
-        writer = cv2.VideoWriter(str(silent_video), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
-        if not writer.isOpened():
-            capture.release()
-            raise RuntimeError("无法创建临时视频编码器。")
-        processed = 1
-        try:
-            for current_frame in frames:
-                writer.write(previous_frame)
-                if enable_interpolation:
-                    for index in range(1, multiplier):
-                        writer.write(interpolator.interpolate(previous_frame, current_frame, index / multiplier))
-                previous_frame = current_frame
-                processed += 1
-                if progress_callback:
-                    percentage = processed / frame_count * 0.9
-                    progress_callback(percentage, f"AI 视频处理中：{processed}/{frame_count} 帧")
-            # OpenCV VideoWriter 不支持显式尾帧时长；重复末帧以保持输出时长与原视频一致。
-            for _ in range(multiplier if enable_interpolation else 1):
-                writer.write(previous_frame)
-        finally:
-            capture.release()
-            writer.release()
-        if progress_callback:
-            progress_callback(0.92, "正在编码 H.264 视频并合并原始音频。")
-        merge_audio(silent_video, source, destination)
+    # 临时无声视频写入 output 下的临时目录，便于运行中查看进度和异常恢复
+    temp_directory = Path("output") / "interpolation" / f".{destination.stem}_tmp"
+    temp_directory.mkdir(parents=True, exist_ok=True)
+    silent_video = temp_directory / "video.mp4"
+    writer = cv2.VideoWriter(str(silent_video), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
+    if not writer.isOpened():
+        capture.release()
+        raise RuntimeError("无法创建临时视频编码器。")
+    processed = 1
+    try:
+        for current_frame in frames:
+            writer.write(previous_frame)
+            if enable_interpolation:
+                for index in range(1, multiplier):
+                    writer.write(interpolator.interpolate(previous_frame, current_frame, index / multiplier))
+            previous_frame = current_frame
+            processed += 1
+            if progress_callback:
+                percentage = processed / frame_count * 0.9
+                progress_callback(percentage, f"AI 视频处理中：{processed}/{frame_count} 帧")
+        # OpenCV VideoWriter 不支持显式尾帧时长；重复末帧以保持输出时长与原视频一致。
+        for _ in range(multiplier if enable_interpolation else 1):
+            writer.write(previous_frame)
+    finally:
+        capture.release()
+        writer.release()
+    if progress_callback:
+        progress_callback(0.92, "正在编码 H.264 视频并合并原始音频。")
+    merge_audio(silent_video, source, destination)
+    # 音视频合并成功后清理临时无声视频
+    shutil.rmtree(temp_directory, ignore_errors=True)
     if progress_callback:
         progress_callback(1, f"处理完成：{source_fps:.3f} FPS -> {output_fps:.3f} FPS")
     return str(destination.resolve())
