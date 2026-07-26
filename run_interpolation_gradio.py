@@ -12,10 +12,10 @@ def read_video_info(video_path: str) -> str:
     if not video_path or not Path(video_path).expanduser().is_file():
         return "请输入有效的视频文件路径。"
     try:
-        fps, duration = probe_video(video_path)
+        fps, duration, frame_count = probe_video(video_path)
     except Exception as error:
         return f"无法读取视频信息：{error}"
-    return f"原始帧率：{fps:.3f} FPS；时长：{duration:.2f} 秒"
+    return f"原始帧率：{fps:.3f} FPS；时长：{duration:.2f} 秒；总帧数：{frame_count}"
 
 
 def process_interpolation(video_path: str, multiplier: int, enable_interpolation: bool, enable_denoise: bool, denoise_strength: float, progress=gr.Progress()) -> str:
