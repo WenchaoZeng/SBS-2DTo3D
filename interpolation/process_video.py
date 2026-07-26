@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import queue
 import shutil
 import subprocess
@@ -59,6 +60,13 @@ def default_output_path(input_path: str | Path, multiplier: int) -> Path:
     return output_dir / f"{source.stem}_{multiplier}x_rife.mp4"
 
 
+def video_encoding_params(width: int, height: int, fps: float) -> list[str]:
+    """根据输出分辨率和帧率计算 H.264 高质量 VBR 编码参数。"""
+    # 固定 8 Mbps 无法覆盖高分辨率和高帧率视频；插帧后按输出帧率同比提高目标码率。
+    bitrate_mbps = min(100, max(12, math.ceil(width * height * fps * 0.18 / 1_000_000)))
+    return ["-b:v", f"{bitrate_mbps}M", "-maxrate", f"{bitrate_mbps * 3 // 2}M", "-bufsize", f"{bitrate_mbps * 3}M", "-pix_fmt", "yuv420p"]
+
+
 def merge_audio(video_path: Path, source_path: Path, output_path: Path) -> None:
     """将原视频音轨合并到已编码的视频中。视频流直接复制（-c:v copy），只处理音频。"""
     ffmpeg_path, _ = require_ffmpeg()
@@ -93,7 +101,7 @@ def denoised_frame_stream(next_frame, denoiser: FastDVDnetDenoiser):
     yield denoiser.denoise([window[1], window[2], window[2], window[2], window[2]])
 
 
-def process_video(input_path: str | Path, multiplier: int, enable_interpolation: bool, enable_denoise: bool, noise_sigma: float = 20, output_path: str | Path | None = None, scale: float = 0.5, progress_callback: ProgressCallback | None = None) -> str:
+def process_video(input_path: str | Path, multiplier: int, enable_interpolation: bool, enable_denoise: bool, noise_sigma: float = 20, output_path: str | Path | None = None, scale: float = 1.0, progress_callback: ProgressCallback | None = None) -> str:
     """按勾选项执行 FastDVDnet 去噪、RIFE 插帧或二者串联，并保留原始音频。"""
     source = Path(input_path).expanduser()
     if not source.is_file():
@@ -151,16 +159,17 @@ def process_video(input_path: str | Path, multiplier: int, enable_interpolation:
         raise RuntimeError("无法解码输入视频的首帧。") from error
     height, width = previous_frame.shape[:2]
     output_fps = source_fps * multiplier if enable_interpolation else source_fps
+    encoding_params = video_encoding_params(width, height, output_fps)
     # 临时无声视频写入 output 下的临时目录，便于运行中查看进度和异常恢复
     temp_directory = Path("output") / "interpolation" / f"{destination.stem}_tmp"
     temp_directory.mkdir(parents=True, exist_ok=True)
     silent_video = temp_directory / "video.mp4"
-    # 使用 VideoToolbox 硬件编码，比 OpenCV mp4v 软件编码快数倍
+    # 使用 VideoToolbox 硬件编码；码率随输出像素数和帧率增长，避免插帧后每帧码率不足。
     try:
-        writer = imageio.get_writer(str(silent_video), fps=output_fps, codec="h264_videotoolbox", ffmpeg_params=["-b:v", "8M", "-pix_fmt", "yuv420p"])
+        writer = imageio.get_writer(str(silent_video), fps=output_fps, codec="h264_videotoolbox", ffmpeg_params=encoding_params)
     except Exception:
         # 非 macOS 环境回退到 libx264 软件编码
-        writer = imageio.get_writer(str(silent_video), fps=output_fps, codec="libx264", ffmpeg_params=["-pix_fmt", "yuv420p"])
+        writer = imageio.get_writer(str(silent_video), fps=output_fps, codec="libx264", ffmpeg_params=encoding_params)
     # RIFE 推理：将上一帧转为 GPU 张量并在迭代间复用，避免每帧重复 CPU→GPU 搬运
     if enable_interpolation:
         prev_tensor, tensor_h, tensor_w = interpolator.to_tensor(previous_frame)
@@ -201,7 +210,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="输入视频路径")
     parser.add_argument("--multiplier", type=int, default=2, choices=(2, 3, 4), help="帧率倍率")
     parser.add_argument("--output", help="输出 MP4 路径，默认输出到 output/interpolation")
-    parser.add_argument("--scale", type=float, default=0.5, choices=(0.5, 1.0), help="推理缩放，默认 0.5 平衡速度与画质，追求最佳画质可用 1.0")
+    parser.add_argument("--scale", type=float, default=1.0, choices=(0.5, 1.0), help="推理缩放，默认 1.0 保持最佳画质；0.5 可降低显存占用并加快处理")
     parser.add_argument("--denoise", action="store_true", help="启用 FastDVDnet 时域去噪")
     parser.add_argument("--denoise-strength", type=float, default=20, help="FastDVDnet 去噪强度，范围 1-50")
     parser.add_argument("--no-interpolation", action="store_true", help="仅去噪，不执行 RIFE 插帧")

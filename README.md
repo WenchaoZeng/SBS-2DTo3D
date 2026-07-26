@@ -94,7 +94,7 @@ chmod +x launch_interpolation.sh
 python3 interpolation/process_video.py --input input/video.mp4 --multiplier 2 --denoise
 ```
 
-4K 视频显存压力较大时，可使用较低的推理缩放：
+4K 视频显存压力较大时，可使用较低的推理缩放（默认 `1.0` 为最佳画质）：
 
 ```bash
 python3 interpolation/process_video.py --input input/video.mp4 --multiplier 2 --scale 0.5
