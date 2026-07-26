@@ -134,7 +134,7 @@ def process_video(input_path: str | Path, multiplier: int, enable_interpolation:
     height, width = previous_frame.shape[:2]
     output_fps = source_fps * multiplier if enable_interpolation else source_fps
     # 临时无声视频写入 output 下的临时目录，便于运行中查看进度和异常恢复
-    temp_directory = Path("output") / "interpolation" / f".{destination.stem}_tmp"
+    temp_directory = Path("output") / "interpolation" / f"{destination.stem}_tmp"
     temp_directory.mkdir(parents=True, exist_ok=True)
     silent_video = temp_directory / "video.mp4"
     writer = cv2.VideoWriter(str(silent_video), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
