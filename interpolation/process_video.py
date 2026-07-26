@@ -93,7 +93,7 @@ def denoised_frame_stream(next_frame, denoiser: FastDVDnetDenoiser):
     yield denoiser.denoise([window[1], window[2], window[2], window[2], window[2]])
 
 
-def process_video(input_path: str | Path, multiplier: int, enable_interpolation: bool, enable_denoise: bool, noise_sigma: float = 20, output_path: str | Path | None = None, scale: float = 1.0, progress_callback: ProgressCallback | None = None) -> str:
+def process_video(input_path: str | Path, multiplier: int, enable_interpolation: bool, enable_denoise: bool, noise_sigma: float = 20, output_path: str | Path | None = None, scale: float = 0.5, progress_callback: ProgressCallback | None = None) -> str:
     """按勾选项执行 FastDVDnet 去噪、RIFE 插帧或二者串联，并保留原始音频。"""
     source = Path(input_path).expanduser()
     if not source.is_file():
@@ -201,7 +201,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="输入视频路径")
     parser.add_argument("--multiplier", type=int, default=2, choices=(2, 3, 4), help="帧率倍率")
     parser.add_argument("--output", help="输出 MP4 路径，默认输出到 output/interpolation")
-    parser.add_argument("--scale", type=float, default=1.0, choices=(0.5, 1.0), help="4K 视频可使用 0.5 降低显存占用")
+    parser.add_argument("--scale", type=float, default=0.5, choices=(0.5, 1.0), help="推理缩放，默认 0.5 平衡速度与画质，追求最佳画质可用 1.0")
     parser.add_argument("--denoise", action="store_true", help="启用 FastDVDnet 时域去噪")
     parser.add_argument("--denoise-strength", type=float, default=20, help="FastDVDnet 去噪强度，范围 1-50")
     parser.add_argument("--no-interpolation", action="store_true", help="仅去噪，不执行 RIFE 插帧")
