@@ -75,6 +75,31 @@ python3 main.py
 
 ```
 
+## RIFE 视频插帧
+
+RIFE 4.25 插帧模型已缓存于 `models/rife/train_log/flownet.pkl`，FastDVDnet 去噪模型已缓存于 `models/fastdvdnet/model.pth`，首次启动无需额外下载。两个模型都会优先使用 NVIDIA CUDA，其次使用 Apple Silicon MPS，最后才回退到 CPU。
+
+启动独立插帧网页：
+
+```bash
+chmod +x launch_interpolation.sh
+./launch_interpolation.sh
+```
+
+访问 `http://127.0.0.1:7861`，输入视频路径后按需要勾选 `启用 RIFE AI 插帧` 与 `启用 FastDVDnet 视频去噪`。两项均勾选时先去噪再插帧；仅勾选去噪时保持原始帧率。输出文件保存在 `output/interpolation/`，原视频音频会重新合并到输出文件。
+
+也可以不启动网页，直接执行独立处理脚本：
+
+```bash
+python3 interpolation/process_video.py --input input/video.mp4 --multiplier 2 --denoise
+```
+
+4K 视频显存压力较大时，可使用较低的推理缩放：
+
+```bash
+python3 interpolation/process_video.py --input input/video.mp4 --multiplier 2 --scale 0.5
+```
+
 
 
 | **Parameter** | **Description** |

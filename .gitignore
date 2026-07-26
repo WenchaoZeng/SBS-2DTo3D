@@ -119,6 +119,11 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# 视频插帧生成文件
+output/interpolation/
+models/rife/
+models/fastdvdnet/
+
 # Environments
 .env
 .venv
