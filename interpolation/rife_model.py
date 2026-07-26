@@ -21,8 +21,8 @@ def select_device() -> torch.device:
 def warp(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     """按光流场反向采样图像，网格始终创建在输入张量所在设备。"""
     height, width = flow.shape[2:]
-    horizontal = torch.linspace(-1.0, 1.0, width, device=image.device).view(1, 1, 1, width)
-    vertical = torch.linspace(-1.0, 1.0, height, device=image.device).view(1, 1, height, 1)
+    horizontal = torch.linspace(-1.0, 1.0, width, device=image.device, dtype=image.dtype).view(1, 1, 1, width)
+    vertical = torch.linspace(-1.0, 1.0, height, device=image.device, dtype=image.dtype).view(1, 1, height, 1)
     grid = torch.cat((horizontal.expand(flow.shape[0], -1, height, -1), vertical.expand(flow.shape[0], -1, -1, width)), 1)
     normalized_flow = torch.cat((flow[:, :1] / ((image.shape[3] - 1.0) / 2.0), flow[:, 1:] / ((image.shape[2] - 1.0) / 2.0)), 1)
     return functional.grid_sample(image, (grid + normalized_flow).permute(0, 2, 3, 1), mode="bilinear", padding_mode="border", align_corners=True)
@@ -121,7 +121,7 @@ class RifeInterpolator:
     """加载本地 RIFE 4.25 权重并提供 OpenCV 帧插帧接口。"""
 
     def __init__(self, model_path: str | Path, scale: float = 1.0) -> None:
-        """读取模型权重并将网络移动到可用的推理设备。"""
+        """读取模型权重并将网络移动到可用的推理设备，MPS/CUDA 上启用 fp16 加速。"""
         weights_path = Path(model_path)
         if not weights_path.is_file():
             raise FileNotFoundError(f"未找到 RIFE 权重：{weights_path}")
@@ -130,16 +130,33 @@ class RifeInterpolator:
         self.network = IFNet().to(self.device).eval()
         state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
         self.network.load_state_dict(state_dict, strict=False)
+        # fp16 半精度推理：MPS/CUDA 上可显著提升速度并降低显存占用
+        self.dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
+        if self.dtype == torch.float16:
+            self.network = self.network.half()
 
-    def interpolate(self, frame0: np.ndarray, frame1: np.ndarray, timestep: float) -> np.ndarray:
-        """为两张 BGR OpenCV 帧生成指定时间位置的 BGR 中间帧。"""
-        height, width = frame0.shape[:2]
+    def to_tensor(self, frame: np.ndarray) -> tuple[torch.Tensor, int, int]:
+        """将 BGR numpy 帧转为 GPU 上已填充的张量，供连续推理时复用，避免重复 CPU→GPU 搬运。"""
+        height, width = frame.shape[:2]
         padded_height = ((height - 1) // 128 + 1) * 128
         padded_width = ((width - 1) // 128 + 1) * 128
         padding = (0, padded_width - width, 0, padded_height - height)
-        image0 = torch.from_numpy(np.ascontiguousarray(frame0[:, :, ::-1].transpose(2, 0, 1))).unsqueeze(0).to(self.device).float() / 255.0
-        image1 = torch.from_numpy(np.ascontiguousarray(frame1[:, :, ::-1].transpose(2, 0, 1))).unsqueeze(0).to(self.device).float() / 255.0
-        with torch.inference_mode():
-            result = self.network(functional.pad(image0, padding), functional.pad(image1, padding), timestep, self.scale)
-        rgb = (result[0, :, :height, :width].clamp(0, 1) * 255).byte().cpu().numpy().transpose(1, 2, 0)
+        tensor = torch.from_numpy(np.ascontiguousarray(frame[:, :, ::-1].transpose(2, 0, 1))).unsqueeze(0).to(self.device, dtype=self.dtype) / 255.0
+        return functional.pad(tensor, padding), height, width
+
+    def from_tensor(self, tensor: torch.Tensor, height: int, width: int) -> np.ndarray:
+        """将 GPU 输出张量转回 BGR numpy 帧，供视频编码器使用。"""
+        rgb = (tensor[0, :, :height, :width].clamp(0, 1).float() * 255).byte().cpu().numpy().transpose(1, 2, 0)
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    def interpolate_tensors(self, image0: torch.Tensor, image1: torch.Tensor, timestep: float, height: int, width: int) -> np.ndarray:
+        """直接在 GPU 张量上推理，避免每帧都做 CPU↔GPU 往返。"""
+        with torch.inference_mode():
+            result = self.network(image0, image1, timestep, self.scale)
+        return self.from_tensor(result, height, width)
+
+    def interpolate(self, frame0: np.ndarray, frame1: np.ndarray, timestep: float) -> np.ndarray:
+        """为两张 BGR OpenCV 帧生成指定时间位置的 BGR 中间帧。"""
+        image0, height, width = self.to_tensor(frame0)
+        image1, _, _ = self.to_tensor(frame1)
+        return self.interpolate_tensors(image0, image1, timestep, height, width)

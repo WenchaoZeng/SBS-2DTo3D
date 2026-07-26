@@ -2,12 +2,15 @@
 
 import argparse
 import json
+import queue
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable
 
 import cv2
+import imageio
 
 try:
     # 作为项目模块导入时使用绝对路径，供 Gradio 页面调用。
@@ -57,27 +60,28 @@ def default_output_path(input_path: str | Path, multiplier: int) -> Path:
 
 
 def merge_audio(video_path: Path, source_path: Path, output_path: Path) -> None:
-    """将原视频音轨与 RIFE 生成的视频流合并为兼容性良好的 MP4。"""
+    """将原视频音轨合并到已编码的视频中。视频流直接复制（-c:v copy），只处理音频。"""
     ffmpeg_path, _ = require_ffmpeg()
-    command = [ffmpeg_path, "-y", "-i", str(video_path), "-i", str(source_path), "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-map_metadata", "1", "-movflags", "+faststart", str(output_path)]
+    # 视频已由 VideoToolbox 硬件编码为 H.264，此处直接复制视频流，避免二次编码
+    command = [ffmpeg_path, "-y", "-i", str(video_path), "-i", str(source_path), "-map", "0:v:0", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-map_metadata", "1", "-movflags", "+faststart", str(output_path)]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:
         raise RuntimeError("音视频合并失败：" + "\n".join(result.stderr.splitlines()[-8:]))
 
 
-def denoised_frame_stream(capture: cv2.VideoCapture, denoiser: FastDVDnetDenoiser):
-    """以五帧滑动窗口流式产出 FastDVDnet 去噪帧，避免缓存完整视频。"""
+def denoised_frame_stream(next_frame, denoiser: FastDVDnetDenoiser):
+    """以五帧滑动窗口流式产出 FastDVDnet 去噪帧，从 next_frame 回调获取原始帧。"""
     initial_frames = []
     for _ in range(3):
-        success, frame = capture.read()
-        if not success:
+        frame = next_frame()
+        if frame is None:
             raise RuntimeError("视频帧数量不足，无法执行 FastDVDnet 去噪。")
         initial_frames.append(frame)
     yield denoiser.denoise([initial_frames[0], initial_frames[0], *initial_frames])
     window = initial_frames
     while True:
-        success, frame = capture.read()
-        if not success:
+        frame = next_frame()
+        if frame is None:
             break
         window.append(frame)
         if len(window) == 4:
@@ -110,57 +114,79 @@ def process_video(input_path: str | Path, multiplier: int, enable_interpolation:
     denoiser = FastDVDnetDenoiser(FASTDVDNET_MODEL_PATH, noise_sigma) if enable_denoise else None
     interpolator = RifeInterpolator(MODEL_PATH, scale) if enable_interpolation else None
     capture = cv2.VideoCapture(str(source))
+    # 后台线程持续读取原始帧，与主线程的 GPU 推理重叠 I/O 等待
+    read_queue: queue.Queue = queue.Queue(maxsize=64)
+
+    def _read_loop():
+        """后台读取线程：将原始帧放入队列，结束时放入 None 哨兵。"""
+        while True:
+            success, frame = capture.read()
+            if not success:
+                break
+            read_queue.put(frame)
+        read_queue.put(None)
+
+    threading.Thread(target=_read_loop, daemon=True).start()
+
+    def next_frame():
+        """从后台读取线程的队列获取下一帧，返回 None 表示结束。"""
+        return read_queue.get()
+
     if enable_denoise:
-        frames = denoised_frame_stream(capture, denoiser)
-        try:
-            previous_frame = next(frames)
-        except StopIteration as error:
-            capture.release()
-            raise RuntimeError("无法解码输入视频的首帧。") from error
+        frames = denoised_frame_stream(next_frame, denoiser)
     else:
-        def raw_frame_stream():
-            """逐帧读取原视频，供仅插帧的路径使用。"""
+        def _raw_frames():
+            """逐帧从队列获取，供仅插帧的路径使用。"""
             while True:
-                success, frame = capture.read()
-                if not success:
+                frame = next_frame()
+                if frame is None:
                     return
                 yield frame
-        frames = raw_frame_stream()
-        try:
-            previous_frame = next(frames)
-        except StopIteration as error:
-            capture.release()
-            raise RuntimeError("无法解码输入视频的首帧。") from error
+        frames = _raw_frames()
+
+    try:
+        previous_frame = next(frames)
+    except (StopIteration, RuntimeError) as error:
+        capture.release()
+        raise RuntimeError("无法解码输入视频的首帧。") from error
     height, width = previous_frame.shape[:2]
     output_fps = source_fps * multiplier if enable_interpolation else source_fps
     # 临时无声视频写入 output 下的临时目录，便于运行中查看进度和异常恢复
     temp_directory = Path("output") / "interpolation" / f"{destination.stem}_tmp"
     temp_directory.mkdir(parents=True, exist_ok=True)
     silent_video = temp_directory / "video.mp4"
-    writer = cv2.VideoWriter(str(silent_video), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
-    if not writer.isOpened():
-        capture.release()
-        raise RuntimeError("无法创建临时视频编码器。")
+    # 使用 VideoToolbox 硬件编码，比 OpenCV mp4v 软件编码快数倍
+    try:
+        writer = imageio.get_writer(str(silent_video), fps=output_fps, codec="h264_videotoolbox", ffmpeg_params=["-b:v", "8M", "-pix_fmt", "yuv420p"])
+    except Exception:
+        # 非 macOS 环境回退到 libx264 软件编码
+        writer = imageio.get_writer(str(silent_video), fps=output_fps, codec="libx264", ffmpeg_params=["-pix_fmt", "yuv420p"])
+    # RIFE 推理：将上一帧转为 GPU 张量并在迭代间复用，避免每帧重复 CPU→GPU 搬运
+    if enable_interpolation:
+        prev_tensor, tensor_h, tensor_w = interpolator.to_tensor(previous_frame)
     processed = 1
     try:
         for current_frame in frames:
-            writer.write(previous_frame)
+            writer.append_data(previous_frame[:, :, ::-1])
             if enable_interpolation:
+                curr_tensor, _, _ = interpolator.to_tensor(current_frame)
                 for index in range(1, multiplier):
-                    writer.write(interpolator.interpolate(previous_frame, current_frame, index / multiplier))
+                    mid_frame = interpolator.interpolate_tensors(prev_tensor, curr_tensor, index / multiplier, tensor_h, tensor_w)
+                    writer.append_data(mid_frame[:, :, ::-1])
+                prev_tensor = curr_tensor
             previous_frame = current_frame
             processed += 1
             if progress_callback:
                 percentage = processed / frame_count * 0.9
                 progress_callback(percentage, f"AI 视频处理中：{processed}/{frame_count} 帧")
-        # OpenCV VideoWriter 不支持显式尾帧时长；重复末帧以保持输出时长与原视频一致。
+        # 重复末帧以保持输出时长与原视频一致
         for _ in range(multiplier if enable_interpolation else 1):
-            writer.write(previous_frame)
+            writer.append_data(previous_frame[:, :, ::-1])
     finally:
         capture.release()
-        writer.release()
+        writer.close()
     if progress_callback:
-        progress_callback(0.92, "正在编码 H.264 视频并合并原始音频。")
+        progress_callback(0.92, "正在合并原始音频。")
     merge_audio(silent_video, source, destination)
     # 音视频合并成功后清理临时无声视频
     shutil.rmtree(temp_directory, ignore_errors=True)

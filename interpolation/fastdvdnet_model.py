@@ -137,6 +137,10 @@ class FastDVDnetDenoiser:
         self.network = FastDVDnet().to(self.device).eval()
         state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
         self.network.load_state_dict({key.removeprefix("module."): value for key, value in state_dict.items()}, strict=True)
+        # fp16 半精度推理：MPS/CUDA 上可显著提升速度并降低显存占用
+        self.dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
+        if self.dtype == torch.float16:
+            self.network = self.network.half()
 
     def denoise(self, frames: list[np.ndarray]) -> np.ndarray:
         """对五张 BGR 帧去噪，返回其中心帧的 BGR 去噪结果。"""
@@ -144,11 +148,11 @@ class FastDVDnetDenoiser:
             raise ValueError("FastDVDnet 去噪需要连续五帧。")
         height, width = frames[0].shape[:2]
         padded_height, padded_width = ((height + 3) // 4) * 4, ((width + 3) // 4) * 4
-        tensors = [torch.from_numpy(np.ascontiguousarray(frame[:, :, ::-1].transpose(2, 0, 1))).float() / 255.0 for frame in frames]
-        value = torch.cat(tensors).unsqueeze(0).to(self.device)
+        tensors = [torch.from_numpy(np.ascontiguousarray(frame[:, :, ::-1].transpose(2, 0, 1))).to(self.device, dtype=self.dtype) / 255.0 for frame in frames]
+        value = torch.cat(tensors).unsqueeze(0)
         padding = (0, padded_width - width, 0, padded_height - height)
-        noise_map = torch.full((1, 1, height, width), self.noise_sigma, device=self.device)
+        noise_map = torch.full((1, 1, height, width), self.noise_sigma, device=self.device, dtype=self.dtype)
         with torch.inference_mode():
             output = self.network(functional.pad(value, padding, mode="reflect"), functional.pad(noise_map, padding, mode="reflect"))
-        rgb = (output[0, :, :height, :width].clamp(0, 1) * 255).byte().cpu().numpy().transpose(1, 2, 0)
+        rgb = (output[0, :, :height, :width].clamp(0, 1).float() * 255).byte().cpu().numpy().transpose(1, 2, 0)
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
